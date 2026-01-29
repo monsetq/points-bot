@@ -16,14 +16,13 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(
     token=TOKEN,
-    parse_mode="HTML"  # задаём напрямую
+    parse_mode="HTML"
 )
 dp = Dispatcher()
 
 conn = sqlite3.connect("users_points.db")
 cur = conn.cursor()
 
-# ------------------ INIT DB ------------------
 def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS users 
                    (user_id INTEGER, 
@@ -38,14 +37,12 @@ def init_db():
 
 init_db()
 
-# ------------------ SILENT LINK ------------------
 def silent_link(name, user_id, username=None):
     if username:
         return f'<a href="https://t.me/{username}">{name}</a>'
     else:
         return hbold(name)
 
-# ------------------ UPDATE USER DATA ------------------
 def update_user_data(user_id, chat_id, name, username=None):
     username = username.replace("@", "").lower() if username else None
     cur.execute("""INSERT OR IGNORE INTO users (user_id, chat_id, points, name, username) 
@@ -58,13 +55,11 @@ def update_user_data(user_id, chat_id, name, username=None):
                     (name, user_id, chat_id))
     conn.commit()
 
-# ------------------ CHECK ADMIN ------------------
 def is_admin(user_id):
     if user_id == OWNER_ID: return True
     cur.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
     return cur.fetchone() is not None
 
-# ------------------ GET TARGET ------------------
 async def get_target_id(message: types.Message, args: list):
     if message.reply_to_message:
         return message.reply_to_message.from_user.id, message.reply_to_message.from_user.first_name
@@ -77,7 +72,6 @@ async def get_target_id(message: types.Message, args: list):
             else: return None, "not_found"
     return None, None
 
-# ------------------ TOP KEYBOARD ------------------
 def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
     builder = InlineKeyboardBuilder()
     if current_page > 0:
@@ -87,7 +81,6 @@ def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
     builder.adjust(2)
     return builder.as_markup()
 
-# ------------------ SEND TOP ------------------
 async def send_top_page(message: types.Message, page: int, owner_id: int, edit: bool = False):
     offset = page * ITEMS_PER_PAGE
 
@@ -120,7 +113,6 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
     else:
         await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
-# ------------------ COMMANDS ------------------
 @dp.message(Command("start", "bhelp", "бпомощь"))
 async def cmd_help(message: types.Message):
     user_id = message.from_user.id
@@ -131,7 +123,7 @@ async def cmd_help(message: types.Message):
             "<b>👑 ПАНЕЛЬ ВЛАДЕЛЬЦА</b>\n\n"
             "👤 <b>Общие:</b>\n• /баланс — ваш счет в этом чате\n\n"
             "🛡 <b>Администрирование:</b>\n• /балл [+/- число] @user — начислить/снять\n"
-            "• /инфо @user — чекнуть баланс\n• /бтоп — топ лидеров\n\n"
+            "• /инфо @user — чекнуть баланс\n• /топб — топ лидеров\n\n"
             "⚙️ <b>Управление доступом:</b>\n• /админ @user — назначить админа\n• /разжаловать @user — снять админа"
         )
     elif is_admin(user_id):
@@ -139,12 +131,13 @@ async def cmd_help(message: types.Message):
             "<b>🛡 ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\n"
             "👤 <b>Общие:</b>\n• /баланс — ваш счет\n\n"
             "🕹 <b>Управление:</b>\n• /балл [+/- число] @user — выдать/забрать баллы\n"
-            "• /инфо @user — посмотреть баллы юзера\n• /бтоп — открыть таблицу лидеров"
+            "• /инфо @user — посмотреть баллы юзера\n• /топб — открыть таблицу лидеров"
         )
     else:
         text = (
             "<b>👤 МЕНЮ УЧАСТНИКА</b>\n\n"
             "• /баланс — узнать свой счет в этой группе\n"
+            "• /топб — посмотреть таблицу лидеров\n\n"
             "<i>Чтобы попасть в топ, проявляйте активность в чате!</i>"
         )
     await message.answer(text, disable_web_page_preview=True)
@@ -220,10 +213,8 @@ async def check_stats(message: types.Message):
     else:
         await message.reply("<b>⚠️ Внимание:</b> Укажите @username или ответьте на сообщение.", disable_web_page_preview=True)
 
-@dp.message(Command("бтоп", "btop"))
+@dp.message(Command("топб", "topb"))
 async def show_top_command(message: types.Message):
-    if not is_admin(message.from_user.id):
-        return
     await send_top_page(message, 0, owner_id=message.from_user.id)
 
 @dp.callback_query(F.data.startswith("top:"))
@@ -241,21 +232,19 @@ async def process_top_pagination(callback: types.CallbackQuery):
 @dp.message(Command("админ", "admin"))
 async def make_admin(message: types.Message):
     if message.from_user.id != OWNER_ID:
-        return  # только владелец может назначать админов
+        return
 
     args = message.text.split()
     tid = None
     tname = None
     tusername = None
 
-    # 1. Если это reply на сообщение
     if message.reply_to_message:
         user = message.reply_to_message.from_user
         tid = user.id
         tname = user.first_name
         tusername = user.username
 
-    # 2. Если указан @username
     elif len(args) > 1:
         uname = args[1].replace("@", "").lower()
         cur.execute("SELECT user_id, name, username FROM users WHERE username = ? AND chat_id = ?", 
@@ -264,7 +253,6 @@ async def make_admin(message: types.Message):
         if res:
             tid, tname, tusername = res
         else:
-            # Попытка найти через Telegram API
             try:
                 user_obj = await bot.get_chat_member(message.chat.id, args[1].replace("@", ""))
                 tid = user_obj.user.id
@@ -273,7 +261,6 @@ async def make_admin(message: types.Message):
             except:
                 return await message.reply("❌ Пользователь не найден.")
 
-    # Если удалось определить пользователя
     if tid:
         cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (tid,))
         conn.commit()
@@ -285,7 +272,7 @@ async def make_admin(message: types.Message):
 @dp.message(Command("разжаловать", "unadmin"))
 async def remove_admin(message: types.Message):
     if message.from_user.id != OWNER_ID:
-        return  # только владелец может снимать админов
+        return
 
     args = message.text.split()
     tid = None
@@ -322,13 +309,11 @@ async def remove_admin(message: types.Message):
             disable_web_page_preview=True
         )
 
-# ------------------ AUTO UPDATE ------------------
 @dp.message()
 async def auto_update(message: types.Message):
     if message.from_user and message.chat.type in ["group", "supergroup"]:
         update_user_data(message.from_user.id, message.chat.id, message.from_user.first_name, message.from_user.username)
 
-# ------------------ PERIODIC UPDATE ------------------
 async def update_all_members(chat_id):
     try:
         async for member in bot.get_chat_administrators(chat_id):
@@ -346,9 +331,8 @@ async def periodic_update():
         chats = [row[0] for row in cur.fetchall()]
         for chat_id in chats:
             await update_all_members(chat_id)
-        await asyncio.sleep(300)  # каждые 5 минут
+        await asyncio.sleep(300)
 
-# ------------------ MAIN ------------------
 async def main():
     asyncio.create_task(periodic_update())
     print(">>> Бот запущен локально!")
