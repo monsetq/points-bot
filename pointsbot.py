@@ -17,7 +17,7 @@ bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-pool = None
+pool = None  # PostgreSQL connection pool
 
 
 # ---------------------- DB ----------------------
@@ -40,6 +40,7 @@ async def init_db():
             user_id BIGINT PRIMARY KEY
         )
         """)
+        # Обновим нули
         await conn.execute("UPDATE users SET points = 50 WHERE points = 0")
 
 
@@ -138,7 +139,7 @@ async def cmd_help(message: types.Message):
         text = (
             "<b>👑 ПАНЕЛЬ ВЛАДЕЛЬЦА</b>\n\n"
             "👤 <b>Общие:</b>\n"
-            "• /моиб — ваш счет в этом чате\n\n"
+            "• /баланс — ваш счет в этом чате\n\n"
             "🛡 <b>Администрирование:</b>\n"
             "• /балл [+/- число] @user — начислить/снять\n"
             "• /инфо @user — чекнуть баланс\n"
@@ -151,23 +152,23 @@ async def cmd_help(message: types.Message):
         text = (
             "<b>🛡 ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\n"
             "👤 <b>Общие:</b>\n"
-            "• /моиб — ваш счет\n\n"
+            "• /баланс — ваш счет\n\n"
             "🕹 <b>Управление:</b>\n"
             "• /балл [+/- число] @user — выдать/забрать баллы\n"
             "• /инфо @user — посмотреть баллы юзера\n"
-            "• /топб — топ лидеров"
+            "• /топб — открыть таблицу лидеров"
         )
     else:
         text = (
             "<b>👤 МЕНЮ УЧАСТНИКА</b>\n\n"
-            "• /моиб — узнать свой счет в этой группе\n"
-            "• /топб — топ лидеров\n"
+            "• /баланс — узнать свой счет в этой группе\n"
+            "• /топб — топ участников\n"
             "<i>Чтобы попасть в топ, проявляйте активность в чате!</i>"
         )
     await message.answer(text)
 
 
-@dp.message(Command("моиб", "myb"))
+@dp.message(Command("баланс", "balance"))
 async def my_points(message: types.Message):
     await update_user_data(message.from_user.id, message.chat.id, message.from_user.first_name, message.from_user.username)
     async with pool.acquire() as conn:
@@ -249,6 +250,7 @@ async def check_stats(message: types.Message):
 
 @dp.message(Command("топб", "topb"))
 async def show_top_command(message: types.Message):
+    # теперь доступно для всех участников
     await send_top_page(message, 0, owner_id=message.from_user.id)
 
 
