@@ -1,3 +1,4 @@
+import os
 import asyncio
 import sqlite3
 import logging
@@ -7,7 +8,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import hbold, hlink
 
-TOKEN = "8446361457:AAFfW1BrEkKvJRiNlUjk2PK3-eTWmcUBL-Y"
+TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = 1875573844
 ITEMS_PER_PAGE = 30
 
