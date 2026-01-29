@@ -4,9 +4,9 @@ import sqlite3
 import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import hbold, hlink
+from aiogram import Bot
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = 1875573844
@@ -14,7 +14,10 @@ ITEMS_PER_PAGE = 30
 
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(
+    token=TOKEN,
+    parse_mode="HTML"  # задаём напрямую
+)
 dp = Dispatcher()
 
 conn = sqlite3.connect("users_points.db")
