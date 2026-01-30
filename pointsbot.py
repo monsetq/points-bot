@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import asyncpg
+import time
+import secrets
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -11,7 +13,11 @@ TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "1875573844"))
 
 MIN_POINTS_TO_TRANSFER = 50
-TRANSFER_RATE = 3  
+TRANSFER_RATE = 3
+
+TRANSFER_CONFIRM_TTL = 300 
+pending_transfers = {} 
+
 ITEMS_PER_PAGE = 30
 logging.basicConfig(level=logging.INFO)
 
@@ -94,6 +100,13 @@ def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
         builder.button(text="⬅️", callback_data=f"top:{user_id}:{current_page - 1}")
     if current_page < total_pages - 1:
         builder.button(text="➡️", callback_data=f"top:{user_id}:{current_page + 1}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def transfer_confirm_kb(token: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data=f"tconf:{token}")
+    builder.button(text="❌ Отмена", callback_data=f"tcancel:{token}")
     builder.adjust(2)
     return builder.as_markup()
 
@@ -183,6 +196,7 @@ async def my_points(message: types.Message):
     points = points if points is not None else 50
     await message.reply(f"💠 {message.from_user.first_name}, у тебя <b>{points}</b> баллов.")
 
+
 @dp.message(Command("передать", "pay"))
 async def transfer_points(message: types.Message):
     await update_user_data(
@@ -193,12 +207,12 @@ async def transfer_points(message: types.Message):
     )
 
     args = message.text.split()
-    if len(args) < 3 and not message.reply_to_message:
+    if len(args) < 2:
         return await message.reply("Используй: <code>/передать 30 @username</code> или ответом: <code>/передать 30</code>")
 
     try:
         amount = int(args[1])
-    except (IndexError, ValueError):
+    except ValueError:
         return await message.reply("Ошибка! Пример: <code>/передать 30 @username</code>")
 
     if amount <= 0:
@@ -214,8 +228,8 @@ async def transfer_points(message: types.Message):
     if tid == message.from_user.id:
         return await message.reply("Нельзя переводить баллы самому себе.")
 
-    received = amount // TRANSFER_RATE
-    if received <= 0:
+    received_raw = amount // TRANSFER_RATE
+    if received_raw <= 0:
         return await message.reply(f"Минимальный перевод: <b>{TRANSFER_RATE}</b> (тогда получатель получит <b>1</b> балл).")
 
     async with pool.acquire() as conn:
@@ -225,51 +239,149 @@ async def transfer_points(message: types.Message):
         )
         sender_pts = sender_pts if sender_pts is not None else 50
 
-        if sender_pts < MIN_POINTS_TO_TRANSFER:
-            return await message.reply(f"❌ Перевод доступен только если у тебя <b>не меньше {MIN_POINTS_TO_TRANSFER}</b> баллов.")
-
-        if sender_pts < amount:
-            return await message.reply("❌ Недостаточно баллов для перевода.")
-
         await update_user_data(tid, message.chat.id, tname)
-
         target_pts = await conn.fetchval(
             "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
             tid, message.chat.id
         )
         target_pts = target_pts if target_pts is not None else 50
 
-        new_sender = max(0, min(100, sender_pts - amount))
-        new_target = max(0, min(100, target_pts + received))
+    max_can_receive = max(0, 100 - target_pts)
+    actual_received = min(received_raw, max_can_receive)
 
-        actual_received = new_target - target_pts
+    if actual_received <= 0:
+        return await message.reply("❌ У получателя уже максимум баллов (100). Перевод невозможен.")
 
-        if actual_received <= 0:
-            return await message.reply("❌ У получателя уже максимум баллов (100). Перевод невозможен.")
+    actual_spent = actual_received * TRANSFER_RATE
 
-        actual_spent = actual_received * TRANSFER_RATE
-
-        if sender_pts < actual_spent:
-            return await message.reply("❌ Недостаточно баллов для перевода с учетом лимитов.")
-
-        new_sender = max(0, min(100, sender_pts - actual_spent))
-
-        await conn.execute(
-            "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
-            new_sender, message.from_user.id, message.chat.id
+    if sender_pts - actual_spent < MIN_POINTS_TO_TRANSFER:
+        return await message.reply(
+            f"❌ Нельзя перевести: после перевода у тебя должно остаться "
+            f"<b>не меньше {MIN_POINTS_TO_TRANSFER}</b> баллов.\n"
+            f"Сейчас: <b>{sender_pts}</b>, спишется: <b>{actual_spent}</b>, останется: <b>{sender_pts - actual_spent}</b>."
         )
-        await conn.execute(
-            "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
-            new_target, tid, message.chat.id
-        )
+
+    if sender_pts < actual_spent:
+        return await message.reply("❌ Недостаточно баллов для перевода.")
 
     sender_l = silent_link(message.from_user.first_name, message.from_user.id)
     target_l = silent_link(tname, tid)
 
-    await message.answer(
-        f"💠 {sender_l} передал {target_l} <b>{actual_received}</b> балл(ов).\n"
-        f"📉 Списано у отправителя: <b>{actual_spent}</b> (курс {TRANSFER_RATE}:1)"
+    token = secrets.token_urlsafe(8).replace("-", "").replace("_", "")
+    pending_transfers[token] = {
+        "created": time.time(),
+        "chat_id": message.chat.id,
+        "sender_id": message.from_user.id,
+        "sender_name": message.from_user.first_name,
+        "target_id": tid,
+        "target_name": tname,
+        "spent": actual_spent,
+        "received": actual_received
+    }
+
+    text = (
+        f"💠 <b>Подтверждение перевода</b>\n\n"
+        f"👤 Отправитель: {sender_l}\n"
+        f"🎯 Получатель: {target_l}\n\n"
+        f"📉 Спишется у отправителя: <b>{actual_spent}</b>\n"
+        f"📈 Получит получатель: <b>{actual_received}</b>\n"
+        f"🔁 Курс: <b>{TRANSFER_RATE}:1</b>\n\n"
+        f"Подтвердить перевод?"
     )
+
+    await message.answer(text, reply_markup=transfer_confirm_kb(token), disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data.startswith("tconf:"))
+async def transfer_confirm(callback: types.CallbackQuery):
+    token = callback.data.split(":", 1)[1]
+    req = pending_transfers.get(token)
+
+    if not req:
+        return await callback.answer("Заявка не найдена или уже обработана.", show_alert=True)
+
+    if time.time() - req["created"] > TRANSFER_CONFIRM_TTL:
+        pending_transfers.pop(token, None)
+        await callback.message.edit_text("⌛ Заявка на перевод истекла.")
+        return await callback.answer()
+
+    if callback.from_user.id != req["sender_id"]:
+        return await callback.answer("Подтверждать может только отправитель.", show_alert=True)
+
+    async with pool.acquire() as conn:
+        sender_pts = await conn.fetchval(
+            "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
+            req["sender_id"], req["chat_id"]
+        )
+        sender_pts = sender_pts if sender_pts is not None else 50
+
+        target_pts = await conn.fetchval(
+            "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
+            req["target_id"], req["chat_id"]
+        )
+        target_pts = target_pts if target_pts is not None else 50
+
+        max_can_receive = max(0, 100 - target_pts)
+        actual_received = min(req["received"], max_can_receive)
+        actual_spent = actual_received * TRANSFER_RATE
+
+        if actual_received <= 0:
+            pending_transfers.pop(token, None)
+            await callback.message.edit_text("❌ Перевод невозможен: у получателя уже 100 баллов.")
+            return await callback.answer()
+
+        if sender_pts < actual_spent:
+            pending_transfers.pop(token, None)
+            await callback.message.edit_text("❌ Перевод невозможен: недостаточно баллов у отправителя.")
+            return await callback.answer()
+
+        if sender_pts - actual_spent < MIN_POINTS_TO_TRANSFER:
+            pending_transfers.pop(token, None)
+            await callback.message.edit_text(
+                f"❌ Перевод невозможен: после перевода у отправителя должно остаться минимум {MIN_POINTS_TO_TRANSFER} баллов."
+            )
+            return await callback.answer()
+
+        new_sender = max(0, min(100, sender_pts - actual_spent))
+        new_target = max(0, min(100, target_pts + actual_received))
+
+        await conn.execute(
+            "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
+            new_sender, req["sender_id"], req["chat_id"]
+        )
+        await conn.execute(
+            "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
+            new_target, req["target_id"], req["chat_id"]
+        )
+
+    pending_transfers.pop(token, None)
+
+    sender_l = silent_link(req["sender_name"], req["sender_id"])
+    target_l = silent_link(req["target_name"], req["target_id"])
+
+    await callback.message.edit_text(
+        f"✅ Перевод выполнен!\n"
+        f"💠 {sender_l} передал {target_l} <b>{actual_received}</b> балл(ов).\n"
+        f"📉 Списано: <b>{actual_spent}</b> (курс {TRANSFER_RATE}:1)",
+        disable_web_page_preview=True
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("tcancel:"))
+async def transfer_cancel(callback: types.CallbackQuery):
+    token = callback.data.split(":", 1)[1]
+    req = pending_transfers.get(token)
+
+    if not req:
+        return await callback.answer("Заявка не найдена или уже обработана.", show_alert=True)
+
+    if callback.from_user.id != req["sender_id"]:
+        return await callback.answer("Отменить может только отправитель.", show_alert=True)
+
+    pending_transfers.pop(token, None)
+    await callback.message.edit_text("❌ Перевод отменён.")
+    await callback.answer()
 
 
 @dp.message(Command("балл", "ball"))
