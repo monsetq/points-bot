@@ -15,8 +15,8 @@ OWNER_ID = int(os.getenv("OWNER_ID", "1875573844"))
 MIN_POINTS_TO_TRANSFER = 50
 TRANSFER_RATE = 3
 
-TRANSFER_CONFIRM_TTL = 300 
-pending_transfers = {} 
+TRANSFER_CONFIRM_TTL = 300
+pending_transfers = {}
 
 ITEMS_PER_PAGE = 30
 logging.basicConfig(level=logging.INFO)
@@ -43,11 +43,15 @@ async def init_db():
             PRIMARY KEY (user_id, chat_id)
         )
         """)
+
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS admins (
-            user_id BIGINT PRIMARY KEY
+            user_id BIGINT PRIMARY KEY,
+            level INT NOT NULL DEFAULT 1
         )
         """)
+        await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS level INT NOT NULL DEFAULT 1")
+
         await conn.execute("UPDATE users SET points = 50 WHERE points = 0")
 
 
@@ -63,12 +67,17 @@ async def update_user_data(user_id, chat_id, name, username=None):
         """, user_id, chat_id, name, username)
 
 
-async def is_admin(user_id):
+# -------- уровни админки --------
+async def get_admin_level(user_id: int) -> int:
     if user_id == OWNER_ID:
-        return True
+        return 999
     async with pool.acquire() as conn:
-        res = await conn.fetchrow("SELECT user_id FROM admins WHERE user_id = $1", user_id)
-        return res is not None
+        row = await conn.fetchrow("SELECT level FROM admins WHERE user_id = $1", user_id)
+    return row["level"] if row else 0
+
+
+async def has_level(user_id: int, min_level: int) -> bool:
+    return (await get_admin_level(user_id)) >= min_level
 
 
 async def get_target_id(message: types.Message, args: list):
@@ -102,6 +111,7 @@ def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
         builder.button(text="➡️", callback_data=f"top:{user_id}:{current_page + 1}")
     builder.adjust(2)
     return builder.as_markup()
+
 
 def transfer_confirm_kb(token: str):
     builder = InlineKeyboardBuilder()
@@ -157,22 +167,23 @@ async def cmd_help(message: types.Message):
             "• /топб — топ лидеров\n"
             "• /передать [число] @user — передать баллы другому участнику\n\n"
             "🛡 <b>Администрирование:</b>\n"
-            "• /балл [+/- число] @user — начислить/снять\n"
-            "• /инфо @user — чекнуть баланс\n\n"
+            "• /балл [+/- число] @user — начислить/снять (уровень ≥ 2)\n"
+            "• /инфо @user — чекнуть баланс (уровень ≥ 1)\n\n"
             "⚙️ <b>Управление доступом:</b>\n"
-            "• /админ @user — назначить админа\n"
+            "• /админ @user [уровень] — назначить админа (1/2)\n"
             "• /разжаловать @user — снять админа"
         )
-    elif await is_admin(user_id):
+    elif await has_level(user_id, 1):
+        lvl = await get_admin_level(user_id)
         text = (
-            "<b>🛡 ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\n"
+            f"<b>🛡 ПАНЕЛЬ АДМИНИСТРАТОРА</b> (уровень <b>{lvl}</b>)\n\n"
             "👤 <b>Общие:</b>\n"
             "• /моиб — узнать свое количество баллов\n"
             "• /топб — открыть таблицу лидеров\n"
             "• /передать [число] @user — передать баллы другому участнику\n\n"
-            "🕹 <b>Управление:</b>\n"
-            "• /балл [+/- число] @user — выдать/забрать баллы\n"
-            "• /инфо @user — посмотреть баллы юзера"
+            "🕹 <b>Доступ:</b>\n"
+            "• /инфо @user — посмотреть баллы юзера (уровень ≥ 1)\n"
+            "• /балл [+/- число] @user — выдать/забрать баллы (уровень ≥ 2)"
         )
     else:
         text = (
@@ -386,8 +397,9 @@ async def transfer_cancel(callback: types.CallbackQuery):
 
 @dp.message(Command("балл", "ball"))
 async def change_points(message: types.Message):
-    if not await is_admin(message.from_user.id):
+    if not await has_level(message.from_user.id, 2):
         return
+
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("Используй: <code>/балл +10 @username</code>")
@@ -427,7 +439,7 @@ async def change_points(message: types.Message):
 
 @dp.message(Command("инфо", "stats"))
 async def check_stats(message: types.Message):
-    if not await is_admin(message.from_user.id):
+    if not await has_level(message.from_user.id, 1):
         return
 
     tid, tname = await get_target_id(message, message.text.split())
@@ -474,11 +486,37 @@ async def process_top_pagination(callback: types.CallbackQuery):
 async def make_admin(message: types.Message):
     if message.from_user.id != OWNER_ID:
         return
-    tid, name = await get_target_id(message, message.text.split())
-    if tid:
-        async with pool.acquire() as conn:
-            await conn.execute("INSERT INTO admins (user_id) VALUES ($1) ON CONFLICT DO NOTHING", tid)
-        await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ</b>.")
+
+    args = message.text.split()
+
+    level = 1
+    if len(args) >= 3:
+        try:
+            level = int(args[2])
+        except ValueError:
+            level = 1
+
+    if level < 1:
+        level = 1
+    if level > 10:
+        level = 10
+
+    tid, name = await get_target_id(message, args)
+    if not tid:
+        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/админ @user 2</code>")
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO admins (user_id, level)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id)
+            DO UPDATE SET level = $2
+            """,
+            tid, level
+        )
+
+    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ {level}</b> уровня.")
 
 
 @dp.message(Command("разжаловать", "unadmin"))
