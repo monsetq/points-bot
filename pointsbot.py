@@ -103,6 +103,14 @@ def silent_link(name, user_id):
     return f'<a href="tg://user?id={user_id}">{name}</a>'
 
 
+async def log_to_owner(text: str):
+    """Отправляет лог владельцу в ЛС (если возможно)."""
+    try:
+        await bot.send_message(OWNER_ID, text, disable_web_page_preview=True)
+    except Exception as e:
+        logging.warning(f"Failed to send log to owner: {e}")
+
+
 def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
     builder = InlineKeyboardBuilder()
     if current_page > 0:
@@ -383,10 +391,27 @@ async def transfer_confirm(callback: types.CallbackQuery):
             new_target, req["target_id"], req["chat_id"]
         )
 
-    pending_transfers.pop(token, None)
+    try:
+        chat_title = callback.message.chat.title or str(req["chat_id"])
+    except Exception:
+        chat_title = str(req["chat_id"])
 
     sender_l = silent_link(req["sender_name"], req["sender_id"])
     target_l = silent_link(req["target_name"], req["target_id"])
+
+    await log_to_owner(
+        "🧾 <b>Лог перевода баллов</b>\n"
+        f"🏷 Чат: <b>{chat_title}</b> (<code>{req['chat_id']}</code>)\n"
+        f"👤 Отправитель: {sender_l} (<code>{req['sender_id']}</code>)\n"
+        f"🎯 Получатель: {target_l} (<code>{req['target_id']}</code>)\n"
+        f"📈 Получено: <b>{actual_received}</b>\n"
+        f"📉 Списано: <b>{actual_spent}</b> (курс {TRANSFER_RATE}:1)\n"
+        f"💠 Балансы после:\n"
+        f"   • отправитель: <b>{new_sender}</b>\n"
+        f"   • получатель: <b>{new_target}</b>"
+    )
+
+    pending_transfers.pop(token, None)
 
     await callback.message.edit_text(
         f"✅ Перевод выполнен!\n"
@@ -432,6 +457,7 @@ async def change_points(message: types.Message):
                     "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
                     tid, message.chat.id
                 )
+                current_pts = current_pts if current_pts is not None else 50
 
                 new_pts = max(0, min(100, current_pts + amount))
                 actual_change = new_pts - current_pts
@@ -445,9 +471,27 @@ async def change_points(message: types.Message):
             target_l = silent_link(tname, tid)
 
             if actual_change >= 0:
-                await message.answer(f"⬆️ Администратор {admin_l} начислил {target_l} <b>{abs(actual_change)}</b> баллов.")
+                await message.answer(
+                    f"⬆️ Администратор {admin_l} начислил {target_l} <b>{abs(actual_change)}</b> баллов."
+                )
             else:
-                await message.answer(f"⬇️ Администратор {admin_l} снял у {target_l} <b>{abs(actual_change)}</b> баллов.")
+                await message.answer(
+                    f"⬇️ Администратор {admin_l} снял у {target_l} <b>{abs(actual_change)}</b> баллов."
+                )
+
+            chat_title = message.chat.title or str(message.chat.id)
+            action = "начислил" if actual_change >= 0 else "снял"
+            sign = "+" if actual_change >= 0 else "-"
+
+            await log_to_owner(
+                "🧾 <b>Лог баллов</b>\n"
+                f"🏷 Чат: <b>{chat_title}</b> (<code>{message.chat.id}</code>)\n"
+                f"👮 Админ: {admin_l} (<code>{message.from_user.id}</code>)\n"
+                f"👤 Участник: {target_l} (<code>{tid}</code>)\n"
+                f"📌 Действие: <b>{action}</b> {sign}<b>{abs(actual_change)}</b>\n"
+                f"💠 Новый баланс: <b>{new_pts}</b>"
+            )
+
         elif tname == "not_found":
             await message.reply("❌ Пользователь не найден в этом чате.")
     except ValueError:
@@ -498,8 +542,6 @@ async def process_top_pagination(callback: types.CallbackQuery):
     await send_top_page(callback.message, page, owner_id=owner_id, edit=True)
     await callback.answer()
 
-
-# ----------- Управление админами -----------
 
 @dp.message(Command("повысить", "promote"))
 async def promote_owner(message: types.Message):
@@ -603,7 +645,6 @@ async def remove_admin(message: types.Message):
     await message.answer(f"❌ {silent_link(name, tid)} больше <b>не админ</b>.")
 
 
-# ---------------------- /бадмины ----------------------
 @dp.message(Command("бадмины", "badmins"))
 async def list_admins(message: types.Message):
     if message.from_user.id != OWNER_ID and not await has_level(message.from_user.id, 2):
@@ -648,7 +689,12 @@ async def list_admins(message: types.Message):
 @dp.message()
 async def auto_update(message: types.Message):
     if message.from_user and message.chat.type in ["group", "supergroup"]:
-        await update_user_data(message.from_user.id, message.chat.id, message.from_user.first_name, message.from_user.username)
+        await update_user_data(
+            message.from_user.id,
+            message.chat.id,
+            message.from_user.first_name,
+            message.from_user.username
+        )
 
 
 # ---------------------- Main ----------------------
