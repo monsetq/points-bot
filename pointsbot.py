@@ -67,7 +67,7 @@ async def update_user_data(user_id, chat_id, name, username=None):
         """, user_id, chat_id, name, username)
 
 
-# -------- уровни админки --------
+# ---------------------- УРОВНИ АДМИНКИ ----------------------
 async def get_admin_level(user_id: int) -> int:
     if user_id == OWNER_ID:
         return 999
@@ -170,8 +170,9 @@ async def cmd_help(message: types.Message):
             "• /балл [+/- число] @user — начислить/снять (уровень ≥ 2)\n"
             "• /инфо @user — чекнуть баланс (уровень ≥ 1)\n\n"
             "⚙️ <b>Управление доступом:</b>\n"
-            "• /админ @user [уровень] — назначить админа (1/2)\n"
-            "• /разжаловать @user — снять админа"
+            "• /повысить @user [1/2] — выдать админку (только владелец)\n"
+            "• /админ @user — выдать админку 1 уровня (админ 2 уровня)\n"
+            "• /разжаловать @user — снять админа (админ 2 снимает только 1 уровень)\n"
         )
     elif await has_level(user_id, 1):
         lvl = await get_admin_level(user_id)
@@ -181,9 +182,11 @@ async def cmd_help(message: types.Message):
             "• /моиб — узнать свое количество баллов\n"
             "• /топб — открыть таблицу лидеров\n"
             "• /передать [число] @user — передать баллы другому участнику\n\n"
-            "🕹 <b>Доступ:</b>\n"
+            "🕹 <b>Управление:</b>\n"
             "• /инфо @user — посмотреть баллы юзера (уровень ≥ 1)\n"
-            "• /балл [+/- число] @user — выдать/забрать баллы (уровень ≥ 2)"
+            "• /балл [+/- число] @user — выдать/забрать баллы (уровень ≥ 2)\n"
+            "• /админ @user — выдать админку 1 уровня (уровень ≥ 2)\n"
+            "• /разжаловать @user — снять админа 1 уровня (уровень ≥ 2)\n"
         )
     else:
         text = (
@@ -399,7 +402,6 @@ async def transfer_cancel(callback: types.CallbackQuery):
 async def change_points(message: types.Message):
     if not await has_level(message.from_user.id, 2):
         return
-
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("Используй: <code>/балл +10 @username</code>")
@@ -482,13 +484,14 @@ async def process_top_pagination(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.message(Command("админ", "admin"))
-async def make_admin(message: types.Message):
+# ----------- Управление админами -----------
+
+@dp.message(Command("повысить", "promote"))
+async def promote_owner(message: types.Message):
     if message.from_user.id != OWNER_ID:
         return
 
     args = message.text.split()
-
     level = 1
     if len(args) >= 3:
         try:
@@ -498,12 +501,15 @@ async def make_admin(message: types.Message):
 
     if level < 1:
         level = 1
-    if level > 10:
-        level = 10
+    if level > 2:
+        level = 2
 
     tid, name = await get_target_id(message, args)
     if not tid:
-        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/админ @user 2</code>")
+        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/повысить @user 2</code>")
+
+    if tid == OWNER_ID:
+        return await message.reply("❌ Нельзя менять права владельца.")
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -519,15 +525,67 @@ async def make_admin(message: types.Message):
     await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ {level}</b> уровня.")
 
 
+@dp.message(Command("админ", "admin"))
+async def make_admin_lvl1(message: types.Message):
+    issuer_id = message.from_user.id
+    if issuer_id != OWNER_ID and not await has_level(issuer_id, 2):
+        return
+
+    args = message.text.split()
+    tid, name = await get_target_id(message, args)
+    if not tid:
+        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/админ @user</code>")
+
+    if tid == OWNER_ID:
+        return await message.reply("❌ Нельзя менять права владельца.")
+
+    async with pool.acquire() as conn:
+        current = await conn.fetchval("SELECT level FROM admins WHERE user_id = $1", tid)
+        if current == 2:
+            return await message.answer(f"ℹ️ {silent_link(name, tid)} уже <b>админ 2</b> уровня.")
+
+        await conn.execute(
+            """
+            INSERT INTO admins (user_id, level)
+            VALUES ($1, 1)
+            ON CONFLICT (user_id)
+            DO UPDATE SET level = GREATEST(admins.level, 1)
+            """,
+            tid
+        )
+
+    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ 1</b> уровня.")
+
+
 @dp.message(Command("разжаловать", "unadmin"))
 async def remove_admin(message: types.Message):
-    if message.from_user.id != OWNER_ID:
+    issuer_id = message.from_user.id
+    issuer_is_owner = (issuer_id == OWNER_ID)
+    issuer_is_lvl2 = await has_level(issuer_id, 2)
+
+    if not issuer_is_owner and not issuer_is_lvl2:
         return
-    tid, name = await get_target_id(message, message.text.split())
-    if tid:
-        async with pool.acquire() as conn:
-            await conn.execute("DELETE FROM admins WHERE user_id = $1", tid)
-        await message.answer(f"❌ {silent_link(name, tid)} больше <b>не админ</b>.")
+
+    args = message.text.split()
+    tid, name = await get_target_id(message, args)
+    if not tid:
+        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/разжаловать @user</code>")
+
+    if tid == OWNER_ID:
+        return await message.reply("❌ Нельзя разжаловать владельца.")
+
+    async with pool.acquire() as conn:
+        current = await conn.fetchval("SELECT level FROM admins WHERE user_id = $1", tid)
+
+        if not current:
+            return await message.answer("ℹ️ Этот пользователь не админ.")
+
+        if not issuer_is_owner and current >= 2:
+            return await message.reply("❌ Ты можешь снимать только <b>админа 1</b> уровня.")
+
+        await conn.execute("DELETE FROM admins WHERE user_id = $1", tid)
+
+    await message.answer(f"❌ {silent_link(name, tid)} больше <b>не админ</b>.")
 
 
 @dp.message()
