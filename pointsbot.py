@@ -10,6 +10,8 @@ from aiogram.utils.markdown import hbold, hlink
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "1875573844"))
 
+MIN_POINTS_TO_TRANSFER = 50
+TRANSFER_RATE = 3  
 ITEMS_PER_PAGE = 30
 logging.basicConfig(level=logging.INFO)
 
@@ -17,7 +19,7 @@ bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-pool = None  # PostgreSQL connection pool
+pool = None
 
 
 # ---------------------- DB ----------------------
@@ -40,7 +42,6 @@ async def init_db():
             user_id BIGINT PRIMARY KEY
         )
         """)
-        # Обновим нули
         await conn.execute("UPDATE users SET points = 50 WHERE points = 0")
 
 
@@ -140,10 +141,11 @@ async def cmd_help(message: types.Message):
             "<b>👑 ПАНЕЛЬ ВЛАДЕЛЬЦА</b>\n\n"
             "👤 <b>Общие:</b>\n"
             "• /моиб — узнать свое количество баллов\n\n"
+            "• /топб — топ лидеров\n\n"
+            "• /передать [число] @user — передать баллы другому участнику\n"
             "🛡 <b>Администрирование:</b>\n"
             "• /балл [+/- число] @user — начислить/снять\n"
             "• /инфо @user — чекнуть баланс\n"
-            "• /топб — топ лидеров\n\n"
             "⚙️ <b>Управление доступом:</b>\n"
             "• /админ @user — назначить админа\n"
             "• /разжаловать @user — снять админа"
@@ -153,16 +155,18 @@ async def cmd_help(message: types.Message):
             "<b>🛡 ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n\n"
             "👤 <b>Общие:</b>\n"
             "• /моиб — узнать свое количество баллов\n\n"
+            "• /топб — открыть таблицу лидеров"
+            "• /передать [число] @user — передать баллы другому участнику\n"
             "🕹 <b>Управление:</b>\n"
             "• /балл [+/- число] @user — выдать/забрать баллы\n"
             "• /инфо @user — посмотреть баллы юзера\n"
-            "• /топб — открыть таблицу лидеров"
         )
     else:
         text = (
             "<b>👤 МЕНЮ УЧАСТНИКА</b>\n\n"
             "• /моиб — узнать свое количество баллов\n"
             "• /топб — топ участников\n"
+            "• /передать [число] @user — передать баллы другому участнику\n"
             "<i>Чтобы попасть в топ, проявляйте активность в чате!</i>"
         )
     await message.answer(text)
@@ -178,6 +182,94 @@ async def my_points(message: types.Message):
         )
     points = points if points is not None else 50
     await message.reply(f"💠 {message.from_user.first_name}, у тебя <b>{points}</b> баллов.")
+
+@dp.message(Command("передать", "pay"))
+async def transfer_points(message: types.Message):
+    await update_user_data(
+        message.from_user.id,
+        message.chat.id,
+        message.from_user.first_name,
+        message.from_user.username
+    )
+
+    args = message.text.split()
+    if len(args) < 3 and not message.reply_to_message:
+        return await message.reply("Используй: <code>/передать 30 @username</code> или ответом: <code>/передать 30</code>")
+
+    try:
+        amount = int(args[1])
+    except (IndexError, ValueError):
+        return await message.reply("Ошибка! Пример: <code>/передать 30 @username</code>")
+
+    if amount <= 0:
+        return await message.reply("Введите положительное число.")
+
+    tid, tname = await get_target_id(message, args)
+
+    if not tid:
+        if tname == "not_found":
+            return await message.reply("❌ Пользователь не найден в этом чате.")
+        return await message.reply("⚠️ Укажите @username или ответьте на сообщение.")
+
+    if tid == message.from_user.id:
+        return await message.reply("Нельзя переводить баллы самому себе.")
+
+    received = amount // TRANSFER_RATE
+    if received <= 0:
+        return await message.reply(f"Минимальный перевод: <b>{TRANSFER_RATE}</b> (тогда получатель получит <b>1</b> балл).")
+
+    async with pool.acquire() as conn:
+        sender_pts = await conn.fetchval(
+            "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
+            message.from_user.id, message.chat.id
+        )
+        sender_pts = sender_pts if sender_pts is not None else 50
+
+        if sender_pts < MIN_POINTS_TO_TRANSFER:
+            return await message.reply(f"❌ Перевод доступен только если у тебя <b>не меньше {MIN_POINTS_TO_TRANSFER}</b> баллов.")
+
+        if sender_pts < amount:
+            return await message.reply("❌ Недостаточно баллов для перевода.")
+
+        await update_user_data(tid, message.chat.id, tname)
+
+        target_pts = await conn.fetchval(
+            "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
+            tid, message.chat.id
+        )
+        target_pts = target_pts if target_pts is not None else 50
+
+        new_sender = max(0, min(100, sender_pts - amount))
+        new_target = max(0, min(100, target_pts + received))
+
+        actual_received = new_target - target_pts
+
+        if actual_received <= 0:
+            return await message.reply("❌ У получателя уже максимум баллов (100). Перевод невозможен.")
+
+        actual_spent = actual_received * TRANSFER_RATE
+
+        if sender_pts < actual_spent:
+            return await message.reply("❌ Недостаточно баллов для перевода с учетом лимитов.")
+
+        new_sender = max(0, min(100, sender_pts - actual_spent))
+
+        await conn.execute(
+            "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
+            new_sender, message.from_user.id, message.chat.id
+        )
+        await conn.execute(
+            "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
+            new_target, tid, message.chat.id
+        )
+
+    sender_l = silent_link(message.from_user.first_name, message.from_user.id)
+    target_l = silent_link(tname, tid)
+
+    await message.answer(
+        f"💠 {sender_l} передал {target_l} <b>{actual_received}</b> балл(ов).\n"
+        f"📉 Списано у отправителя: <b>{actual_spent}</b> (курс {TRANSFER_RATE}:1)"
+    )
 
 
 @dp.message(Command("балл", "ball"))
@@ -250,7 +342,6 @@ async def check_stats(message: types.Message):
 
 @dp.message(Command("топб", "topb"))
 async def show_top_command(message: types.Message):
-    # теперь доступно для всех участников
     await send_top_page(message, 0, owner_id=message.from_user.id)
 
 
