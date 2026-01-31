@@ -5,7 +5,7 @@ import asyncpg
 import time
 import secrets
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import hbold, hlink
 
@@ -86,6 +86,7 @@ async def has_level(user_id: int, min_level: int) -> bool:
 async def get_target_id(message: types.Message, args: list):
     if message.reply_to_message:
         return message.reply_to_message.from_user.id, message.reply_to_message.from_user.first_name
+
     for arg in args:
         if arg.startswith("@"):
             uname = arg.replace("@", "").lower()
@@ -96,14 +97,72 @@ async def get_target_id(message: types.Message, args: list):
                 )
             if res:
                 return res["user_id"], res["name"]
-            else:
-                return None, "not_found"
+            return None, "not_found"
+
     return None, None
 
 
 # ---------------------- ТОП ----------------------
 def silent_link(name, user_id):
     return f'<a href="tg://user?id={user_id}">{name}</a>'
+
+
+async def log_to_owner(text: str):
+    try:
+        await bot.send_message(OWNER_ID, text, disable_web_page_preview=True)
+    except Exception as e:
+        logging.warning(f"Failed to send log to owner: {e}")
+
+
+def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
+    builder = InlineKeyboardBuilder()
+    if current_page > 0:
+        builder.button(text="⬅️", callback_data=f"top:{user_id}:{current_page - 1}")
+    if current_page < total_pages - 1:
+        builder.button(text="➡️", callback_data=f"top:{user_id}:{current_page + 1}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def transfer_confirm_kb(token: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data=f"tconf:{token}")
+    builder.button(text="❌ Отмена", callback_data=f"tcancel:{token}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+async def send_top_page(message: types.Message, page: int, owner_id: int, edit: bool = False):
+    offset = page * ITEMS_PER_PAGE
+    async with pool.acquire() as conn:
+        total_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE chat_id = $1", message.chat.id)
+        total_pages = (total_count + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+
+        top = await conn.fetch(
+            "SELECT user_id, name, points, username FROM users "
+            "WHERE chat_id = $1 ORDER BY points DESC LIMIT $2 OFFSET $3",
+            message.chat.id, ITEMS_PER_PAGE, offset
+        )
+
+    if not top:
+        return await message.answer("💠 Список лидеров пока пуст.")
+
+    res = [f"💠 {hbold('ТОП ЛИДЕРОВ')} ({page + 1}/{total_pages})\n"]
+    for i, row in enumerate(top, 1 + offset):
+        uid, name, pts, username = row["user_id"], row["name"], row["points"], row["username"]
+        if username:
+            user_link = hlink(name, f"https://t.me/{username}")
+        else:
+            user_link = name
+        res.append(f"{i}. {user_link} — {hbold(pts)}")
+
+    text = "\n".join(res)
+    kb = get_top_keyboard(page, total_pages, owner_id)
+
+    if edit:
+        await message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    else:
+        await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 # ---------------------- Команды ----------------------
@@ -387,6 +446,7 @@ async def transfer_cancel(callback: types.CallbackQuery):
 async def change_points(message: types.Message):
     if not await has_level(message.from_user.id, 2):
         return
+
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("Используй: <code>/балл +10 @username</code>")
@@ -397,6 +457,7 @@ async def change_points(message: types.Message):
 
         if tid:
             await update_user_data(tid, message.chat.id, tname)
+
             async with pool.acquire() as conn:
                 current_pts = await conn.fetchval(
                     "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
@@ -416,13 +477,9 @@ async def change_points(message: types.Message):
             target_l = silent_link(tname, tid)
 
             if actual_change >= 0:
-                await message.answer(
-                    f"⬆️ Администратор {admin_l} начислил {target_l} <b>{abs(actual_change)}</b> баллов."
-                )
+                await message.answer(f"⬆️ Администратор {admin_l} начислил {target_l} <b>{abs(actual_change)}</b> баллов.")
             else:
-                await message.answer(
-                    f"⬇️ Администратор {admin_l} снял у {target_l} <b>{abs(actual_change)}</b> баллов."
-                )
+                await message.answer(f"⬇️ Администратор {admin_l} снял у {target_l} <b>{abs(actual_change)}</b> баллов.")
 
             chat_title = message.chat.title or str(message.chat.id)
             action = "начислил" if actual_change >= 0 else "снял"
@@ -439,6 +496,9 @@ async def change_points(message: types.Message):
 
         elif tname == "not_found":
             await message.reply("❌ Пользователь не найден в этом чате.")
+        else:
+            await message.reply("⚠️ Укажите @username или ответьте на сообщение.")
+
     except ValueError:
         await message.reply("Ошибка! Введите число.")
 
@@ -488,6 +548,7 @@ async def process_top_pagination(callback: types.CallbackQuery):
     await callback.answer()
 
 
+# ----------- Управление админами -----------
 @dp.message(Command("повысить", "promote"))
 async def promote_owner(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -590,6 +651,7 @@ async def remove_admin(message: types.Message):
     await message.answer(f"❌ {silent_link(name, tid)} больше <b>не админ</b>.")
 
 
+# ---------------------- /бадмины ----------------------
 @dp.message(Command("бадмины", "badmins"))
 async def list_admins(message: types.Message):
     if message.from_user.id != OWNER_ID and not await has_level(message.from_user.id, 2):
