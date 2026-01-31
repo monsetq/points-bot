@@ -58,12 +58,15 @@ async def init_db():
 async def update_user_data(user_id, chat_id, name, username=None):
     if username:
         username = username.replace("@", "").lower()
+
     async with pool.acquire() as conn:
         await conn.execute("""
         INSERT INTO users (user_id, chat_id, points, name, username)
         VALUES ($1, $2, 50, $3, $4)
         ON CONFLICT (user_id, chat_id)
-        DO UPDATE SET name = $3, username = $4
+        DO UPDATE SET
+            name = EXCLUDED.name,
+            username = COALESCE(EXCLUDED.username, users.username)
         """, user_id, chat_id, name, username)
 
 
@@ -101,64 +104,6 @@ async def get_target_id(message: types.Message, args: list):
 # ---------------------- ТОП ----------------------
 def silent_link(name, user_id):
     return f'<a href="tg://user?id={user_id}">{name}</a>'
-
-
-async def log_to_owner(text: str):
-    """Отправляет лог владельцу в ЛС (если возможно)."""
-    try:
-        await bot.send_message(OWNER_ID, text, disable_web_page_preview=True)
-    except Exception as e:
-        logging.warning(f"Failed to send log to owner: {e}")
-
-
-def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
-    builder = InlineKeyboardBuilder()
-    if current_page > 0:
-        builder.button(text="⬅️", callback_data=f"top:{user_id}:{current_page - 1}")
-    if current_page < total_pages - 1:
-        builder.button(text="➡️", callback_data=f"top:{user_id}:{current_page + 1}")
-    builder.adjust(2)
-    return builder.as_markup()
-
-
-def transfer_confirm_kb(token: str):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Подтвердить", callback_data=f"tconf:{token}")
-    builder.button(text="❌ Отмена", callback_data=f"tcancel:{token}")
-    builder.adjust(2)
-    return builder.as_markup()
-
-
-async def send_top_page(message: types.Message, page: int, owner_id: int, edit: bool = False):
-    offset = page * ITEMS_PER_PAGE
-    async with pool.acquire() as conn:
-        total_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE chat_id = $1", message.chat.id)
-        total_pages = (total_count + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
-
-        top = await conn.fetch(
-            "SELECT user_id, name, points, username FROM users WHERE chat_id = $1 ORDER BY points DESC LIMIT $2 OFFSET $3",
-            message.chat.id, ITEMS_PER_PAGE, offset
-        )
-
-    if not top:
-        return await message.answer("💠 Список лидеров пока пуст.")
-
-    res = [f"💠 {hbold('ТОП ЛИДЕРОВ')} ({page + 1}/{total_pages})\n"]
-    for i, row in enumerate(top, 1 + offset):
-        uid, name, pts, username = row["user_id"], row["name"], row["points"], row["username"]
-        if username:
-            user_link = hlink(name, f"https://t.me/{username}")
-        else:
-            user_link = name
-        res.append(f"{i}. {user_link} — {hbold(pts)}")
-
-    text = "\n".join(res)
-    kb = get_top_keyboard(page, total_pages, owner_id)
-
-    if edit:
-        await message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
-    else:
-        await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 # ---------------------- Команды ----------------------
