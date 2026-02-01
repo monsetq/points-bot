@@ -55,15 +55,38 @@ async def init_db():
 
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS admins (
-            chat_id BIGINT,
-            user_id BIGINT,
+            user_id BIGINT PRIMARY KEY,
             level INT NOT NULL DEFAULT 1
         )
         """)
 
         await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS chat_id BIGINT")
-        await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS user_id BIGINT")
         await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS level INT NOT NULL DEFAULT 1")
+        await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS user_id BIGINT")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS admins_v2 (
+            chat_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            level INT NOT NULL DEFAULT 1,
+            PRIMARY KEY (chat_id, user_id)
+        )
+        """)
+
+        await conn.execute("""
+        INSERT INTO admins_v2 (chat_id, user_id, level)
+        SELECT COALESCE(chat_id, 0) AS chat_id, user_id, level
+        FROM admins
+        WHERE user_id IS NOT NULL
+        ON CONFLICT (chat_id, user_id)
+        DO UPDATE SET level = GREATEST(admins_v2.level, EXCLUDED.level)
+        """)
+
+        try:
+            await conn.execute("DROP TABLE admins")
+            await conn.execute("ALTER TABLE admins_v2 RENAME TO admins")
+        except Exception:
+            pass
 
         await conn.execute("""
         UPDATE users u
@@ -77,6 +100,7 @@ async def init_db():
         SET points = 50
         WHERE points = 0
         """)
+
 
 
 async def get_join_points(chat_id: int) -> int:
@@ -134,21 +158,19 @@ async def has_level(user_id: int, chat_id: int, min_level: int) -> bool:
 async def set_admin_level(chat_id: int, user_id: int, level: int, mode: str = "force"):
     async with pool.acquire() as conn:
         if mode == "max":
-            res = await conn.execute(
-                "UPDATE admins SET level = GREATEST(level, $3) WHERE chat_id = $1 AND user_id = $2",
-                chat_id, user_id, level
-            )
+            await conn.execute("""
+                INSERT INTO admins (chat_id, user_id, level)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET level = GREATEST(admins.level, EXCLUDED.level)
+            """, chat_id, user_id, level)
         else:
-            res = await conn.execute(
-                "UPDATE admins SET level = $3 WHERE chat_id = $1 AND user_id = $2",
-                chat_id, user_id, level
-            )
-
-        if res.endswith("UPDATE 0"):
-            await conn.execute(
-                "INSERT INTO admins (chat_id, user_id, level) VALUES ($1, $2, $3)",
-                chat_id, user_id, level
-            )
+            await conn.execute("""
+                INSERT INTO admins (chat_id, user_id, level)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET level = EXCLUDED.level
+            """, chat_id, user_id, level)
 
 
 async def remove_admin_level(chat_id: int, user_id: int):
