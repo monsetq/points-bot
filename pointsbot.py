@@ -21,6 +21,7 @@ pending_transfers = {}
 ITEMS_PER_PAGE = 30
 logging.basicConfig(level=logging.INFO)
 
+# ✅ общий лимит баллов
 BALANCE_MIN = 0
 BALANCE_MAX = 100
 
@@ -35,7 +36,6 @@ async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL)
     async with pool.acquire() as conn:
-        # users
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT,
