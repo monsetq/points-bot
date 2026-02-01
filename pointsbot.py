@@ -62,6 +62,8 @@ async def init_db():
         """)
 
         await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS chat_id BIGINT")
+        await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS user_id BIGINT")
+        await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS level INT NOT NULL DEFAULT 1")
 
         await conn.execute("""
         UPDATE users u
@@ -89,7 +91,7 @@ async def get_join_points(chat_id: int) -> int:
         return int(jp)
 
 
-async def update_user_data(user_id, chat_id, name, username=None):
+async def update_user_data(user_id: int, chat_id: int, name: str, username: str | None = None):
     if username:
         username = username.replace("@", "").lower()
 
@@ -131,10 +133,6 @@ async def has_level(user_id: int, chat_id: int, min_level: int) -> bool:
 
 async def set_admin_level(chat_id: int, user_id: int, level: int, mode: str = "force"):
     async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM admins WHERE chat_id = $1 AND user_id = $2 AND level IS NULL",
-            chat_id, user_id
-        )
         if mode == "max":
             res = await conn.execute(
                 "UPDATE admins SET level = GREATEST(level, $3) WHERE chat_id = $1 AND user_id = $2",
@@ -148,10 +146,6 @@ async def set_admin_level(chat_id: int, user_id: int, level: int, mode: str = "f
 
         if res.endswith("UPDATE 0"):
             await conn.execute(
-                "DELETE FROM admins WHERE chat_id = $1 AND user_id = $2",
-                chat_id, user_id
-            )
-            await conn.execute(
                 "INSERT INTO admins (chat_id, user_id, level) VALUES ($1, $2, $3)",
                 chat_id, user_id, level
             )
@@ -162,24 +156,68 @@ async def remove_admin_level(chat_id: int, user_id: int):
         await conn.execute("DELETE FROM admins WHERE chat_id = $1 AND user_id = $2", chat_id, user_id)
 
 
-async def get_target_id(message: types.Message, args: list):
-    if message.reply_to_message:
+async def resolve_target(message: types.Message, args: list):
+    """
+    Возвращает: (tid, name, username, err)
+    err:
+      None - ок
+      "no_target" - не указали
+      "not_found" - нигде не нашли username в БД
+      "not_in_chat" - нашли user_id глобально, но его нет в этом чате (или бот не смог проверить)
+    """
+    if message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
-        return u.id, u.first_name, u.username
+        return u.id, u.first_name, u.username, None
 
-    for arg in args:
-        if arg.startswith("@"):
-            uname = arg.replace("@", "").lower()
-            async with pool.acquire() as conn:
-                res = await conn.fetchrow(
-                    "SELECT user_id, name, username FROM users WHERE username = $1 AND chat_id = $2",
-                    uname, message.chat.id
-                )
-            if res:
-                return res["user_id"], res["name"], res["username"]
-            return None, "not_found", None
+    uname = None
+    for a in args:
+        if a.startswith("@"):
+            uname = a.replace("@", "").lower()
+            break
 
-    return None, None, None
+    if not uname:
+        return None, None, None, "no_target"
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id, name, username FROM users WHERE chat_id = $1 AND username = $2",
+            message.chat.id, uname
+        )
+    if row:
+        return row["user_id"], row["name"], row["username"], None
+
+    async with pool.acquire() as conn:
+        row2 = await conn.fetchrow(
+            "SELECT user_id, name, username FROM users WHERE username = $1 ORDER BY chat_id DESC LIMIT 1",
+            uname
+        )
+    if not row2:
+        return None, None, None, "not_found"
+
+    tid = int(row2["user_id"])
+    tname = row2["name"] or uname
+    tuname = row2["username"]
+
+    try:
+        member = await bot.get_chat_member(message.chat.id, tid)
+        if member.status in ("left", "kicked"):
+            return None, None, None, "not_in_chat"
+    except Exception:
+        return None, None, None, "not_in_chat"
+
+    await update_user_data(tid, message.chat.id, tname, tuname)
+    return tid, tname, tuname, None
+
+
+def silent_link(name, user_id):
+    return f'<a href="tg://user?id={user_id}">{name}</a>'
+
+
+async def log_to_owner(text: str):
+    try:
+        await bot.send_message(OWNER_ID, text, disable_web_page_preview=True)
+    except Exception as e:
+        logging.warning(f"Failed to send log to owner: {e}")
 
 
 def extract_reason_from_args(args: list) -> str:
@@ -208,17 +246,6 @@ def extract_mass_reason(args: list) -> str:
     if last_at == -1:
         return ""
     return " ".join(args[last_at + 1:]).strip()
-
-
-def silent_link(name, user_id):
-    return f'<a href="tg://user?id={user_id}">{name}</a>'
-
-
-async def log_to_owner(text: str):
-    try:
-        await bot.send_message(OWNER_ID, text, disable_web_page_preview=True)
-    except Exception as e:
-        logging.warning(f"Failed to send log to owner: {e}")
 
 
 def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
@@ -254,7 +281,7 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
     if not top:
         return await message.answer("💠 Список лидеров пока пуст.")
 
-    res = [f"💠 {hbold('ТОП ЛИДЕРОВ')} ({page + 1}/{total_pages})\n"]
+    res = [f"🏆 <b>ТОП ЛИДЕРОВ</b> <i>({page + 1}/{total_pages})</i>\n"]
     for i, row in enumerate(top, 1 + offset):
         uid, name, pts, username = row["user_id"], row["name"], row["points"], row["username"]
         if username:
@@ -272,93 +299,77 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
         await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
-def help_text(role: str, lvl: int, join_points: int) -> str:
-    base = (
-        "<b>💠 Меню бота</b>\n"
-        f"<i>Стартовые баллы в этом чате: {join_points}</i>\n\n"
-        "<b>👤 Участнику</b>\n"
-        "• <code>/моиб</code> — мой баланс\n"
-        "• <code>/топб</code> — топ лидеров\n"
-        "• <code>/передать 30 @user</code> — перевод баллов\n"
+def help_block(title: str, lines: list[str]) -> str:
+    body = "\n".join([f"• {x}" for x in lines])
+    return f"<b>{title}</b>\n{body}\n"
+
+
+def build_help(role: str, lvl: int, join_points: int) -> str:
+    header = (
+        "<b>💠 Меню бота баллов</b>\n"
+        f"🧩 Стартовые баллы: <b>{join_points}</b>\n"
+        f"🔒 Лимит баланса: <b>{BALANCE_MIN}</b>–<b>{BALANCE_MAX}</b>\n"
+        f"🔁 Курс перевода: <b>{TRANSFER_RATE}:1</b>\n\n"
     )
 
+    common = help_block("👤 Участнику", [
+        "<code>/моиб</code> — баланс",
+        "<code>/топб</code> — лидеры",
+        "<code>/передать</code> — перевод баллов",
+    ])
+
     if role == "member":
-        return base + "\n<i>Чтобы бот мог найти тебя по @username, напиши хотя бы одно сообщение в чате.</i>"
+        return header + common
+
+    admin1 = help_block("🛡 Админу 1 уровня", [
+        "<code>/инфо</code> — баланс участника",
+    ])
 
     if role == "admin1":
-        return (
-            base
-            + "\n<b>🛡 Админ (1 уровень)</b>\n"
-            "• <code>/инфо @user</code> — баланс участника\n"
-        )
+        return header + common + admin1
 
-    if role in ("admin2", "owner"):
-        extra_admin = (
-            "\n<b>🛡 Админ (2 уровень)</b>\n"
-            "• <code>/балл +10 @user причина</code> — начислить\n"
-            "• <code>/балл -10 @user причина</code> — снять\n"
-            "• <code>/баллм -5 @u1 @u2 причина</code> — массово\n"
-            "• <code>/инфо @user</code> — баланс участника\n"
-            "\n<b>⚙️ Настройки чата</b>\n"
-            "• <code>/стартбаллы 50</code> — стартовые баллы\n"
-            "\n<b>🔑 Админка в этом чате</b>\n"
-            "• <code>/админ @user</code> — выдать админа 1\n"
-            "• <code>/повысить @user 2</code> — выдать админа 2\n"
-            "• <code>/разжаловать @user</code> — снять админку\n"
-            "• <code>/бадмины</code> — список админов\n"
-        )
-        if role == "owner":
-            return "<b>👑 Панель владельца</b>\n\n" + extra_admin + "\n" + base
-        return base + extra_admin
+    admin2 = help_block("🛡 Админу 2 уровня", [
+        "<code>/балл</code> — начислить/снять баллы",
+        "<code>/баллм</code> — массово начислить/снять",
+        "<code>/стартбаллы</code> — стартовые баллы чата",
+        "<code>/админ</code> — выдать админа 1 уровня",
+        "<code>/повысить</code> — выдать админа 2 уровня",
+        "<code>/разжаловать</code> — снять админку",
+        "<code>/бадмины</code> — список админов",
+    ])
 
-    return base
+    if role == "owner":
+        owner = help_block("👑 Владельцу", [
+            "Полный доступ в любом чате",
+        ])
+        return header + owner + common + admin1 + admin2
+
+    return header + common + admin1 + admin2
 
 
-@dp.my_chat_member()
-async def bot_added_auto_admin(event: types.ChatMemberUpdated):
-    old_status = getattr(event.old_chat_member, "status", None)
-    new_status = getattr(event.new_chat_member, "status", None)
-
-    if old_status in ("left", "kicked") and new_status in ("member", "administrator"):
-        chat_id = event.chat.id
-        inviter = event.from_user
-        if inviter and inviter.id:
-            await update_user_data(inviter.id, chat_id, inviter.first_name, inviter.username)
-            await set_admin_level(chat_id, inviter.id, 2, mode="max")
-            try:
-                await bot.send_message(
-                    chat_id,
-                    f"🛡 {silent_link(inviter.first_name, inviter.id)} получил <b>админ 2</b> уровня.",
-                    disable_web_page_preview=True
-                )
-            except Exception:
-                pass
-
-
-@dp.message(F.new_chat_members)
-async def on_new_members(message: types.Message):
-    for m in message.new_chat_members:
-        if m.is_bot:
-            continue
-        await update_user_data(m.id, message.chat.id, m.first_name, m.username)
-
-
-@dp.message(Command("start", "bhelp", "бпомощь", "help"))
+@dp.message(Command("start", "help", "bhelp", "бпомощь"))
 async def cmd_help(message: types.Message):
-    await update_user_data(message.from_user.id, message.chat.id, message.from_user.first_name, message.from_user.username)
+    await update_user_data(
+        message.from_user.id,
+        message.chat.id,
+        message.from_user.first_name,
+        message.from_user.username
+    )
+
     lvl = await get_admin_level(message.from_user.id, message.chat.id)
     jp = await get_join_points(message.chat.id)
 
     if message.from_user.id == OWNER_ID:
-        text = help_text("owner", lvl, jp)
+        text = build_help("owner", lvl, jp)
     elif lvl >= 2:
-        text = help_text("admin2", lvl, jp)
+        text = build_help("admin2", lvl, jp)
     elif lvl >= 1:
-        text = help_text("admin1", lvl, jp)
+        text = build_help("admin1", lvl, jp)
     else:
-        text = help_text("member", lvl, jp)
+        text = build_help("member", lvl, jp)
 
     await message.answer(text, disable_web_page_preview=True)
+
 
 
 @dp.message(Command("стартбаллы", "joinpoints"))
@@ -409,15 +420,13 @@ async def check_stats(message: types.Message):
     if not await has_level(message.from_user.id, message.chat.id, 1):
         return
 
-    tid, tname, tuname = await get_target_id(message, message.text.split())
-    if not tid:
-        if tname == "not_found":
-            return await message.reply("❌ Пользователь не найден в этом чате.")
-        return await message.reply("⚠️ Укажите @username или ответьте на сообщение.")
-
-    if message.reply_to_message:
-        u = message.reply_to_message.from_user
-        await update_user_data(u.id, message.chat.id, u.first_name, u.username)
+    tid, tname, tuname, err = await resolve_target(message, message.text.split())
+    if err == "no_target":
+        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/инфо @user</code>")
+    if err == "not_found":
+        return await message.reply("❌ Пользователь не найден. Пусть он напишет сообщение в любой чат с ботом.")
+    if err == "not_in_chat":
+        return await message.reply("❌ Этот @username не найден среди участников этого чата.")
 
     if not await user_exists_in_chat(tid, message.chat.id):
         return await message.reply("❌ Пользователь не найден в базе этого чата.\nПусть он напишет сообщение.")
@@ -478,16 +487,13 @@ async def transfer_points(message: types.Message):
     if amount <= 0:
         return await message.reply("Введите положительное число.")
 
-    tid, tname, tuname = await get_target_id(message, args)
-
-    if not tid:
-        if tname == "not_found":
-            return await message.reply("❌ Пользователь не найден в этом чате.")
-        return await message.reply("⚠️ Укажите @username или ответьте на сообщение.")
-
-    if message.reply_to_message:
-        u = message.reply_to_message.from_user
-        await update_user_data(u.id, message.chat.id, u.first_name, u.username)
+    tid, tname, tuname, err = await resolve_target(message, args)
+    if err == "no_target":
+        return await message.reply("⚠️ Укажи @username или ответь на сообщение.")
+    if err == "not_found":
+        return await message.reply("❌ Пользователь не найден. Пусть он напишет сообщение в любой чат с ботом.")
+    if err == "not_in_chat":
+        return await message.reply("❌ Этот @username не найден среди участников этого чата.")
 
     if not await user_exists_in_chat(tid, message.chat.id):
         return await message.reply("❌ Пользователь не найден в базе этого чата.\nПусть он напишет сообщение.")
@@ -692,16 +698,13 @@ async def change_points(message: types.Message):
     except ValueError:
         return await message.reply("Ошибка! Пример: <code>/балл -2 @user флуд</code>")
 
-    tid, tname, tuname = await get_target_id(message, args)
-
-    if not tid:
-        if tname == "not_found":
-            return await message.reply("❌ Пользователь не найден в этом чате.")
-        return await message.reply("⚠️ Укажите @username или ответьте на сообщение.")
-
-    if message.reply_to_message:
-        u = message.reply_to_message.from_user
-        await update_user_data(u.id, message.chat.id, u.first_name, u.username)
+    tid, tname, tuname, err = await resolve_target(message, args)
+    if err == "no_target":
+        return await message.reply("⚠️ Укажи @username или ответь на сообщение.")
+    if err == "not_found":
+        return await message.reply("❌ Пользователь не найден. Пусть он напишет сообщение в любой чат с ботом.")
+    if err == "not_in_chat":
+        return await message.reply("❌ Этот @username не найден среди участников этого чата.")
 
     if not await user_exists_in_chat(tid, message.chat.id):
         return await message.reply("❌ Пользователь не найден в базе этого чата.\nПусть он напишет сообщение.")
@@ -801,14 +804,14 @@ async def change_points_mass(message: types.Message):
             uname = raw.replace("@", "").lower()
 
             row = await conn.fetchrow(
-                "SELECT user_id, name, points FROM users WHERE chat_id = $1 AND username = $2",
+                "SELECT user_id, name, points, username FROM users WHERE chat_id = $1 AND username = $2",
                 message.chat.id, uname
             )
             if not row:
                 fail_lines.append(f"• @{uname}: не найден в этом чате")
                 continue
 
-            tid = row["user_id"]
+            tid = int(row["user_id"])
             tname = row["name"] or uname
             current_pts = row["points"]
             if current_pts is None:
@@ -875,21 +878,18 @@ async def promote_owner(message: types.Message):
             level = int(args[2])
         except ValueError:
             level = 1
-
     level = max(1, min(2, level))
 
-    tid, name, tuname = await get_target_id(message, args)
-    if not tid:
-        if name == "not_found":
-            return await message.reply("❌ Пользователь не найден в этом чате.")
+    tid, name, tuname, err = await resolve_target(message, args)
+    if err == "no_target":
         return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/повысить @user 2</code>")
+    if err == "not_found":
+        return await message.reply("❌ Пользователь не найден. Пусть он напишет сообщение в любой чат с ботом.")
+    if err == "not_in_chat":
+        return await message.reply("❌ Этот @username не найден среди участников этого чата.")
 
     if tid == OWNER_ID:
         return await message.reply("❌ Нельзя менять права владельца.")
-
-    if message.reply_to_message:
-        u = message.reply_to_message.from_user
-        await update_user_data(u.id, message.chat.id, u.first_name, u.username)
 
     if not await user_exists_in_chat(tid, message.chat.id):
         return await message.reply("❌ Пользователь не найден в базе этого чата.\nПусть он напишет сообщение.")
@@ -907,18 +907,16 @@ async def make_admin_lvl1(message: types.Message):
         return
 
     args = message.text.split()
-    tid, name, tuname = await get_target_id(message, args)
-    if not tid:
-        if name == "not_found":
-            return await message.reply("❌ Пользователь не найден в этом чате.")
+    tid, name, tuname, err = await resolve_target(message, args)
+    if err == "no_target":
         return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/админ @user</code>")
+    if err == "not_found":
+        return await message.reply("❌ Пользователь не найден. Пусть он напишет сообщение в любой чат с ботом.")
+    if err == "not_in_chat":
+        return await message.reply("❌ Этот @username не найден среди участников этого чата.")
 
     if tid == OWNER_ID:
         return await message.reply("❌ Нельзя менять права владельца.")
-
-    if message.reply_to_message:
-        u = message.reply_to_message.from_user
-        await update_user_data(u.id, message.chat.id, u.first_name, u.username)
 
     if not await user_exists_in_chat(tid, message.chat.id):
         return await message.reply("❌ Пользователь не найден в базе этого чата.\nПусть он напишет сообщение.")
@@ -940,18 +938,16 @@ async def remove_admin(message: types.Message):
         return
 
     args = message.text.split()
-    tid, name, tuname = await get_target_id(message, args)
-    if not tid:
-        if name == "not_found":
-            return await message.reply("❌ Пользователь не найден в этом чате.")
+    tid, name, tuname, err = await resolve_target(message, args)
+    if err == "no_target":
         return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/разжаловать @user</code>")
+    if err == "not_found":
+        return await message.reply("❌ Пользователь не найден. Пусть он напишет сообщение в любой чат с ботом.")
+    if err == "not_in_chat":
+        return await message.reply("❌ Этот @username не найден среди участников этого чата.")
 
     if tid == OWNER_ID:
         return await message.reply("❌ Нельзя разжаловать владельца.")
-
-    if message.reply_to_message:
-        u = message.reply_to_message.from_user
-        await update_user_data(u.id, message.chat.id, u.first_name, u.username)
 
     if not await user_exists_in_chat(tid, message.chat.id):
         return await message.reply("❌ Пользователь не найден в базе этого чата.")
