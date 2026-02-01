@@ -21,7 +21,6 @@ pending_transfers = {}
 ITEMS_PER_PAGE = 30
 logging.basicConfig(level=logging.INFO)
 
-# ✅ общий лимит баллов
 BALANCE_MIN = 0
 BALANCE_MAX = 100
 
@@ -272,10 +271,10 @@ async def cmd_help(message: types.Message):
             "• /передать [число] @user — передать\n\n"
             "🛡 <b>Администрирование:</b>\n"
             "• /балл [+/- число] @user [причина] — начислить/снять\n"
-            "• /инфо @user — чекнуть баланс\n\n"
+            "• /инфо @user — посмотреть баланс баллов участника\n\n"
             "⚙️ <b>Настройки чата:</b>\n"
             "• /стартбаллы [число] — стартовые баллы\n\n"
-            "🛡 <b>Админка (в этом чате):</b>\n"
+            "🛡 <b>Админка:</b>\n"
             "• /повысить @user [1/2]\n"
             "• /админ @user\n"
             "• /разжаловать @user\n"
@@ -287,11 +286,11 @@ async def cmd_help(message: types.Message):
             "• /моиб — баланс\n"
             "• /топб — топ\n"
             "• /передать [число] @user — передать\n\n"
-            "• /инфо @user — посмотреть\n"
+            "• /инфо @user — посмотреть баланс баллов участника\n"
             "• /балл [+/- число] @user [причина]\n\n"
             "⚙️ <b>Настройки чата:</b>\n"
             "• /стартбаллы [число]\n\n"
-            "🛡 <b>Админка (в этом чате):</b>\n"
+            "🛡 <b>Админка:</b>\n"
             "• /админ @user\n"
             "• /повысить @user 2\n"
             "• /разжаловать @user\n"
@@ -303,7 +302,7 @@ async def cmd_help(message: types.Message):
             "• /моиб — баланс\n"
             "• /топб — топ\n"
             "• /передать [число] @user — передать\n"
-            "• /инфо @user — посмотреть\n"
+            "• /инфо @user — посмотреть баланс баллов участника\n"
         )
     else:
         text = (
@@ -743,7 +742,7 @@ async def promote_owner(message: types.Message):
             message.chat.id, tid, level
         )
 
-    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ {level}</b> уровня (в этом чате).")
+    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ {level}</b> уровня.")
 
 
 @dp.message(Command("админ", "admin"))
@@ -769,7 +768,7 @@ async def make_admin_lvl1(message: types.Message):
             message.chat.id, tid
         )
         if current == 2:
-            return await message.answer(f"ℹ️ {silent_link(name, tid)} уже <b>админ 2</b> уровня (в этом чате).")
+            return await message.answer(f"ℹ️ {silent_link(name, tid)} уже <b>админ 2</b> уровня.")
 
         await conn.execute(
             """
@@ -781,7 +780,7 @@ async def make_admin_lvl1(message: types.Message):
             message.chat.id, tid
         )
 
-    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ 1</b> уровня (в этом чате).")
+    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ 1</b> уровня.")
 
 
 @dp.message(Command("разжаловать", "unadmin"))
@@ -808,17 +807,17 @@ async def remove_admin(message: types.Message):
         )
 
         if not current:
-            return await message.answer("ℹ️ Этот пользователь не админ (в этом чате).")
+            return await message.answer("ℹ️ Этот пользователь не админ.")
 
         if not issuer_is_owner and current >= 2:
-            return await message.reply("❌ Ты можешь снимать только <b>админа 1</b> уровня (в этом чате).")
+            return await message.reply("❌ Ты можешь снимать только <b>админа 1</b> уровня.")
 
         await conn.execute(
             "DELETE FROM admins WHERE chat_id = $1 AND user_id = $2",
             message.chat.id, tid
         )
 
-    await message.answer(f"❌ {silent_link(name, tid)} больше <b>не админ</b> (в этом чате).")
+    await message.answer(f"❌ {silent_link(name, tid)} больше <b>не админ</b>.")
 
 
 @dp.message(Command("бадмины", "badmins"))
@@ -841,9 +840,9 @@ async def list_admins(message: types.Message):
         """, message.chat.id)
 
     if not rows:
-        return await message.answer("Список админов пуст (в этом чате).")
+        return await message.answer("Список админов пуст.")
 
-    lines = ["<b>🛡 Список админов (в этом чате)</b>\n"]
+    lines = ["<b>🛡 Список админов</b>\n"]
     for i, r in enumerate(rows, 1):
         name = r["name"] or "Без имени"
         username = r["username"]
