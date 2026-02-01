@@ -102,6 +102,29 @@ async def get_target_id(message: types.Message, args: list):
     return None, None
 
 
+def extract_reason_from_args(args: list) -> str:
+    """
+    Форматы:
+    - /балл +10 @user причина...
+    - /балл -2 причина... (если ответом)
+    """
+    if len(args) <= 2:
+        return ""
+
+    at_index = None
+    for i, a in enumerate(args):
+        if a.startswith("@"):
+            at_index = i
+            break
+
+    if at_index is not None:
+        reason_parts = args[at_index + 1:]
+    else:
+        reason_parts = args[2:]
+
+    return " ".join(reason_parts).strip()
+
+
 # ---------------------- ТОП ----------------------
 def silent_link(name, user_id):
     return f'<a href="tg://user?id={user_id}">{name}</a>'
@@ -179,7 +202,7 @@ async def cmd_help(message: types.Message):
             "• /топб — топ лидеров\n"
             "• /передать [число] @user — передать баллы другому участнику\n\n"
             "🛡 <b>Администрирование:</b>\n"
-            "• /балл [+/- число] @user — начислить/снять\n"
+            "• /балл [+/- число] @user [причина] — начислить/снять\n"
             "• /инфо @user — чекнуть баланс\n\n"
             "⚙️ <b>Управление доступом:</b>\n"
             "• /повысить @user [1/2] — выдать админку\n"
@@ -199,7 +222,7 @@ async def cmd_help(message: types.Message):
                 "• /передать [число] @user — передать баллы другому участнику\n\n"
                 "🕹 <b>Управление:</b>\n"
                 "• /инфо @user — посмотреть баллы юзера\n"
-                "• /балл [+/- число] @user — выдать/забрать баллы\n\n"
+                "• /балл [+/- число] @user [причина] — выдать/забрать баллы\n\n"
                 "🛡 <b>Админка:</b>\n"
                 "• /админ @user — выдать админку\n"
                 "• /разжаловать @user — снять админа\n"
@@ -449,58 +472,70 @@ async def change_points(message: types.Message):
 
     args = message.text.split()
     if len(args) < 2:
-        return await message.reply("Используй: <code>/балл +10 @username</code>")
+        return await message.reply(
+            "Используй: <code>/балл +10 @username причина</code> или ответом: <code>/балл +10 причина</code>"
+        )
 
     try:
         amount = int(args[1])
-        tid, tname = await get_target_id(message, args)
-
-        if tid:
-            await update_user_data(tid, message.chat.id, tname)
-
-            async with pool.acquire() as conn:
-                current_pts = await conn.fetchval(
-                    "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
-                    tid, message.chat.id
-                )
-                current_pts = current_pts if current_pts is not None else 50
-
-                new_pts = max(0, min(100, current_pts + amount))
-                actual_change = new_pts - current_pts
-
-                await conn.execute(
-                    "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
-                    new_pts, tid, message.chat.id
-                )
-
-            admin_l = silent_link(message.from_user.first_name, message.from_user.id)
-            target_l = silent_link(tname, tid)
-
-            if actual_change >= 0:
-                await message.answer(f"⬆️ Администратор {admin_l} начислил {target_l} <b>{abs(actual_change)}</b> баллов.")
-            else:
-                await message.answer(f"⬇️ Администратор {admin_l} снял у {target_l} <b>{abs(actual_change)}</b> баллов.")
-
-            chat_title = message.chat.title or str(message.chat.id)
-            action = "начислил" if actual_change >= 0 else "снял"
-            sign = "+" if actual_change >= 0 else "-"
-
-            await log_to_owner(
-                "🧾 <b>Лог баллов</b>\n"
-                f"🏷 Чат: <b>{chat_title}</b> (<code>{message.chat.id}</code>)\n"
-                f"👮 Админ: {admin_l} (<code>{message.from_user.id}</code>)\n"
-                f"👤 Участник: {target_l} (<code>{tid}</code>)\n"
-                f"📌 Действие: <b>{action}</b> {sign}<b>{abs(actual_change)}</b>\n"
-                f"💠 Новый баланс: <b>{new_pts}</b>"
-            )
-
-        elif tname == "not_found":
-            await message.reply("❌ Пользователь не найден в этом чате.")
-        else:
-            await message.reply("⚠️ Укажите @username или ответьте на сообщение.")
-
     except ValueError:
-        await message.reply("Ошибка! Введите число.")
+        return await message.reply("Ошибка! Введите число. Пример: <code>/балл -2 @user флуд</code>")
+
+    tid, tname = await get_target_id(message, args)
+
+    if not tid:
+        if tname == "not_found":
+            return await message.reply("❌ Пользователь не найден в этом чате.")
+        return await message.reply("⚠️ Укажите @username или ответьте на сообщение.")
+
+    reason = extract_reason_from_args(args)
+    reason_line_chat = f"\n📝 Причина: <i>{reason}</i>" if reason else ""
+    reason_line_log = f"\n📝 Причина: <b>{reason}</b>" if reason else "\n📝 Причина: <i>не указана</i>"
+
+    await update_user_data(tid, message.chat.id, tname)
+
+    async with pool.acquire() as conn:
+        current_pts = await conn.fetchval(
+            "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
+            tid, message.chat.id
+        )
+        current_pts = current_pts if current_pts is not None else 50
+
+        new_pts = max(0, min(100, current_pts + amount))
+        actual_change = new_pts - current_pts
+
+        await conn.execute(
+            "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
+            new_pts, tid, message.chat.id
+        )
+
+    admin_l = silent_link(message.from_user.first_name, message.from_user.id)
+    target_l = silent_link(tname, tid)
+
+    if actual_change >= 0:
+        await message.answer(
+            f"⬆️ Администратор {admin_l} начислил {target_l} <b>{abs(actual_change)}</b> баллов."
+            f"{reason_line_chat}"
+        )
+    else:
+        await message.answer(
+            f"⬇️ Администратор {admin_l} снял у {target_l} <b>{abs(actual_change)}</b> баллов."
+            f"{reason_line_chat}"
+        )
+
+    chat_title = message.chat.title or str(message.chat.id)
+    action = "начислил" if actual_change >= 0 else "снял"
+    sign = "+" if actual_change >= 0 else "-"
+
+    await log_to_owner(
+        "🧾 <b>Лог баллов</b>\n"
+        f"🏷 Чат: <b>{chat_title}</b> (<code>{message.chat.id}</code>)\n"
+        f"👮 Админ: {admin_l} (<code>{message.from_user.id}</code>)\n"
+        f"👤 Участник: {target_l} (<code>{tid}</code>)\n"
+        f"📌 Действие: <b>{action}</b> {sign}<b>{abs(actual_change)}</b>\n"
+        f"💠 Новый баланс: <b>{new_pts}</b>"
+        f"{reason_line_log}"
+    )
 
 
 @dp.message(Command("инфо", "stats"))
