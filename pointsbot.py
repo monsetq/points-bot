@@ -21,6 +21,9 @@ pending_transfers = {}
 ITEMS_PER_PAGE = 30
 logging.basicConfig(level=logging.INFO)
 
+BALANCE_MIN = 0
+BALANCE_MAX = 100
+
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
@@ -28,16 +31,16 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 pool = None
 
 
-# ---------------------- DB ----------------------
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL)
     async with pool.acquire() as conn:
+        # users
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT,
             chat_id BIGINT,
-            points INT DEFAULT 50,
+            points INT DEFAULT 0,
             name TEXT,
             username TEXT,
             PRIMARY KEY (user_id, chat_id)
@@ -45,42 +48,76 @@ async def init_db():
         """)
 
         await conn.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id BIGINT PRIMARY KEY,
-            level INT NOT NULL DEFAULT 1
+        CREATE TABLE IF NOT EXISTS chat_settings (
+            chat_id BIGINT PRIMARY KEY,
+            join_points INT NOT NULL DEFAULT 50
         )
         """)
-        await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS level INT NOT NULL DEFAULT 1")
 
-        await conn.execute("UPDATE users SET points = 50 WHERE points = 0")
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            chat_id BIGINT,
+            user_id BIGINT,
+            level INT NOT NULL DEFAULT 1,
+            PRIMARY KEY (chat_id, user_id)
+        )
+        """)
+
+        await conn.execute("""
+        UPDATE users u
+        SET points = cs.join_points
+        FROM chat_settings cs
+        WHERE u.chat_id = cs.chat_id AND u.points = 0
+        """)
+        await conn.execute("""
+        UPDATE users
+        SET points = 50
+        WHERE points = 0
+        """)
+
+
+async def get_join_points(chat_id: int) -> int:
+    async with pool.acquire() as conn:
+        jp = await conn.fetchval("SELECT join_points FROM chat_settings WHERE chat_id = $1", chat_id)
+        if jp is None:
+            await conn.execute(
+                "INSERT INTO chat_settings (chat_id, join_points) VALUES ($1, 50) ON CONFLICT (chat_id) DO NOTHING",
+                chat_id
+            )
+            return 50
+        return int(jp)
 
 
 async def update_user_data(user_id, chat_id, name, username=None):
     if username:
         username = username.replace("@", "").lower()
 
+    join_points = await get_join_points(chat_id)
+
     async with pool.acquire() as conn:
         await conn.execute("""
         INSERT INTO users (user_id, chat_id, points, name, username)
-        VALUES ($1, $2, 50, $3, $4)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (user_id, chat_id)
         DO UPDATE SET
             name = EXCLUDED.name,
             username = COALESCE(EXCLUDED.username, users.username)
-        """, user_id, chat_id, name, username)
+        """, user_id, chat_id, join_points, name, username)
 
 
-# ---------------------- УРОВНИ АДМИНКИ ----------------------
-async def get_admin_level(user_id: int) -> int:
+async def get_admin_level(user_id: int, chat_id: int) -> int:
     if user_id == OWNER_ID:
         return 999
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT level FROM admins WHERE user_id = $1", user_id)
+        row = await conn.fetchrow(
+            "SELECT level FROM admins WHERE user_id = $1 AND chat_id = $2",
+            user_id, chat_id
+        )
     return row["level"] if row else 0
 
 
-async def has_level(user_id: int, min_level: int) -> bool:
-    return (await get_admin_level(user_id)) >= min_level
+async def has_level(user_id: int, chat_id: int, min_level: int) -> bool:
+    return (await get_admin_level(user_id, chat_id)) >= min_level
 
 
 async def get_target_id(message: types.Message, args: list):
@@ -103,11 +140,6 @@ async def get_target_id(message: types.Message, args: list):
 
 
 def extract_reason_from_args(args: list) -> str:
-    """
-    Форматы:
-    - /балл +10 @user причина...
-    - /балл -2 причина... (если ответом)
-    """
     if len(args) <= 2:
         return ""
 
@@ -125,7 +157,6 @@ def extract_reason_from_args(args: list) -> str:
     return " ".join(reason_parts).strip()
 
 
-# ---------------------- ТОП ----------------------
 def silent_link(name, user_id):
     return f'<a href="tg://user?id={user_id}">{name}</a>'
 
@@ -188,65 +219,134 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
         await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
-# ---------------------- Команды ----------------------
+@dp.my_chat_member()
+async def bot_added_auto_admin(event: types.ChatMemberUpdated):
+    old_status = getattr(event.old_chat_member, "status", None)
+    new_status = getattr(event.new_chat_member, "status", None)
+
+    if old_status in ("left", "kicked") and new_status in ("member", "administrator"):
+        chat_id = event.chat.id
+        inviter = event.from_user
+
+        if inviter and inviter.id:
+            await update_user_data(inviter.id, chat_id, inviter.first_name, inviter.username)
+
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO admins (chat_id, user_id, level)
+                    VALUES ($1, $2, 2)
+                    ON CONFLICT (chat_id, user_id)
+                    DO UPDATE SET level = GREATEST(admins.level, 2)
+                """, chat_id, inviter.id)
+
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"🛡 {silent_link(inviter.first_name, inviter.id)} получил <b>админ 2</b> уровня (добавил бота).",
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
+
+
+@dp.message(F.new_chat_members)
+async def on_new_members(message: types.Message):
+    for m in message.new_chat_members:
+        if m.is_bot:
+            continue
+        await update_user_data(m.id, message.chat.id, m.first_name, m.username)
+
+
 @dp.message(Command("start", "bhelp", "бпомощь"))
 async def cmd_help(message: types.Message):
     user_id = message.from_user.id
     await update_user_data(user_id, message.chat.id, message.from_user.first_name, message.from_user.username)
 
+    lvl = await get_admin_level(user_id, message.chat.id)
+
     if user_id == OWNER_ID:
         text = (
             "<b>👑 ПАНЕЛЬ ВЛАДЕЛЬЦА</b>\n\n"
-            "👤 <b>Общие:</b>\n"
-            "• /моиб — узнать свое количество баллов\n"
-            "• /топб — топ лидеров\n"
-            "• /передать [число] @user — передать баллы другому участнику\n\n"
+            "• /моиб — баланс\n"
+            "• /топб — топ\n"
+            "• /передать [число] @user — передать\n\n"
             "🛡 <b>Администрирование:</b>\n"
             "• /балл [+/- число] @user [причина] — начислить/снять\n"
             "• /инфо @user — чекнуть баланс\n\n"
-            "⚙️ <b>Управление доступом:</b>\n"
-            "• /повысить @user [1/2] — выдать админку\n"
-            "• /админ @user — выдать админку 1 уровня\n"
-            "• /разжаловать @user — снять админа\n"
-            "• /бадмины — список админов\n"
+            "⚙️ <b>Настройки чата:</b>\n"
+            "• /стартбаллы [число] — стартовые баллы\n\n"
+            "🛡 <b>Админка (в этом чате):</b>\n"
+            "• /повысить @user [1/2]\n"
+            "• /админ @user\n"
+            "• /разжаловать @user\n"
+            "• /бадмины\n"
         )
-    elif await has_level(user_id, 1):
-        lvl = await get_admin_level(user_id)
-
-        if lvl >= 2:
-            text = (
-                f"<b>🛡 ПАНЕЛЬ АДМИНИСТРАТОРА</b> (уровень <b>{lvl}</b>)\n\n"
-                "👤 <b>Общие:</b>\n"
-                "• /моиб — узнать свое количество баллов\n"
-                "• /топб — открыть таблицу лидеров\n"
-                "• /передать [число] @user — передать баллы другому участнику\n\n"
-                "🕹 <b>Управление:</b>\n"
-                "• /инфо @user — посмотреть баллы юзера\n"
-                "• /балл [+/- число] @user [причина] — выдать/забрать баллы\n\n"
-                "🛡 <b>Админка:</b>\n"
-                "• /админ @user — выдать админку\n"
-                "• /разжаловать @user — снять админа\n"
-                "• /бадмины — список админов\n"
-            )
-        else:
-            text = (
-                f"<b>🛡 ПАНЕЛЬ АДМИНИСТРАТОРА</b> (уровень <b>{lvl}</b>)\n\n"
-                "👤 <b>Общие:</b>\n"
-                "• /моиб — узнать свое количество баллов\n"
-                "• /топб — открыть таблицу лидеров\n"
-                "• /передать [число] @user — передать баллы другому участнику\n\n"
-                "🕹 <b>Доступ:</b>\n"
-                "• /инфо @user — посмотреть баллы юзера\n"
-            )
+    elif lvl >= 2:
+        text = (
+            f"<b>🛡 ПАНЕЛЬ АДМИНИСТРАТОРА</b> (уровень <b>{lvl}</b>)\n\n"
+            "• /моиб — баланс\n"
+            "• /топб — топ\n"
+            "• /передать [число] @user — передать\n\n"
+            "• /инфо @user — посмотреть\n"
+            "• /балл [+/- число] @user [причина]\n\n"
+            "⚙️ <b>Настройки чата:</b>\n"
+            "• /стартбаллы [число]\n\n"
+            "🛡 <b>Админка (в этом чате):</b>\n"
+            "• /админ @user\n"
+            "• /повысить @user 2\n"
+            "• /разжаловать @user\n"
+            "• /бадмины\n"
+        )
+    elif lvl >= 1:
+        text = (
+            f"<b>🛡 ПАНЕЛЬ АДМИНИСТРАТОРА</b> (уровень <b>{lvl}</b>)\n\n"
+            "• /моиб — баланс\n"
+            "• /топб — топ\n"
+            "• /передать [число] @user — передать\n"
+            "• /инфо @user — посмотреть\n"
+        )
     else:
         text = (
             "<b>👤 МЕНЮ УЧАСТНИКА</b>\n\n"
-            "• /моиб — узнать свое количество баллов\n"
-            "• /топб — топ участников\n"
-            "• /передать [число] @user — передать баллы другому участнику\n\n"
-            "<i>Чтобы попасть в топ, проявляйте активность в чате!</i>"
+            "• /моиб — баланс\n"
+            "• /топб — топ\n"
+            "• /передать [число] @user — передать\n"
         )
     await message.answer(text)
+
+
+@dp.message(Command("стартбаллы", "joinpoints"))
+async def set_join_points(message: types.Message):
+    if not await has_level(message.from_user.id, message.chat.id, 2):
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        jp = await get_join_points(message.chat.id)
+        return await message.reply(
+            f"Текущие стартовые баллы: <b>{jp}</b>\n"
+            f"Установить: <code>/стартбаллы 50</code>"
+        )
+
+    try:
+        jp = int(args[1])
+    except ValueError:
+        return await message.reply("Введите число. Пример: <code>/стартбаллы 50</code>")
+
+    if jp < BALANCE_MIN:
+        jp = BALANCE_MIN
+    if jp > BALANCE_MAX:
+        jp = BALANCE_MAX
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO chat_settings (chat_id, join_points)
+            VALUES ($1, $2)
+            ON CONFLICT (chat_id)
+            DO UPDATE SET join_points = $2
+        """, message.chat.id, jp)
+
+    await message.reply(f"✅ Стартовые баллы в этом чате установлены на <b>{jp}</b>.")
 
 
 @dp.message(Command("моиб", "myb"))
@@ -257,7 +357,8 @@ async def my_points(message: types.Message):
             "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
             message.from_user.id, message.chat.id
         )
-    points = points if points is not None else 50
+    if points is None:
+        points = await get_join_points(message.chat.id)
     await message.reply(f"💠 {message.from_user.first_name}, у тебя <b>{points}</b> баллов.")
 
 
@@ -301,21 +402,27 @@ async def transfer_points(message: types.Message):
             "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
             message.from_user.id, message.chat.id
         )
-        sender_pts = sender_pts if sender_pts is not None else 50
+        if sender_pts is None:
+            sender_pts = await get_join_points(message.chat.id)
 
         await update_user_data(tid, message.chat.id, tname)
         target_pts = await conn.fetchval(
             "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
             tid, message.chat.id
         )
-        target_pts = target_pts if target_pts is not None else 50
+        if target_pts is None:
+            target_pts = await get_join_points(message.chat.id)
 
-    max_can_receive = max(0, 100 - target_pts)
-    actual_received = min(received_raw, max_can_receive)
+    if target_pts + received_raw > BALANCE_MAX:
+        can = max(0, BALANCE_MAX - target_pts)
+        return await message.reply(
+            f"❌ Перевод невозможен: у получателя будет больше <b>{BALANCE_MAX}</b> баллов.\n"
+            f"Сейчас у получателя: <b>{target_pts}</b>.\n"
+            f"Он может принять максимум: <b>{can}</b> балл(ов).\n"
+            f"Ты хотел перевести (получит): <b>{received_raw}</b>."
+        )
 
-    if actual_received <= 0:
-        return await message.reply("❌ У получателя уже максимум баллов (100). Перевод невозможен.")
-
+    actual_received = received_raw
     actual_spent = actual_received * TRANSFER_RATE
 
     if sender_pts - actual_spent < MIN_POINTS_TO_TRANSFER:
@@ -377,21 +484,24 @@ async def transfer_confirm(callback: types.CallbackQuery):
             "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
             req["sender_id"], req["chat_id"]
         )
-        sender_pts = sender_pts if sender_pts is not None else 50
+        if sender_pts is None:
+            sender_pts = await get_join_points(req["chat_id"])
 
         target_pts = await conn.fetchval(
             "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
             req["target_id"], req["chat_id"]
         )
-        target_pts = target_pts if target_pts is not None else 50
+        if target_pts is None:
+            target_pts = await get_join_points(req["chat_id"])
 
-        max_can_receive = max(0, 100 - target_pts)
-        actual_received = min(req["received"], max_can_receive)
-        actual_spent = actual_received * TRANSFER_RATE
+        actual_received = req["received"]
+        actual_spent = req["spent"]
 
-        if actual_received <= 0:
+        if target_pts + actual_received > BALANCE_MAX:
             pending_transfers.pop(token, None)
-            await callback.message.edit_text("❌ Перевод невозможен: у получателя уже 100 баллов.")
+            await callback.message.edit_text(
+                f"❌ Перевод невозможен: у получателя будет больше {BALANCE_MAX} баллов."
+            )
             return await callback.answer()
 
         if sender_pts < actual_spent:
@@ -406,8 +516,8 @@ async def transfer_confirm(callback: types.CallbackQuery):
             )
             return await callback.answer()
 
-        new_sender = max(0, min(100, sender_pts - actual_spent))
-        new_target = max(0, min(100, target_pts + actual_received))
+        new_sender = sender_pts - actual_spent
+        new_target = target_pts + actual_received
 
         await conn.execute(
             "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
@@ -467,7 +577,7 @@ async def transfer_cancel(callback: types.CallbackQuery):
 
 @dp.message(Command("балл", "ball"))
 async def change_points(message: types.Message):
-    if not await has_level(message.from_user.id, 2):
+    if not await has_level(message.from_user.id, message.chat.id, 2):
         return
 
     args = message.text.split()
@@ -499,10 +609,23 @@ async def change_points(message: types.Message):
             "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
             tid, message.chat.id
         )
-        current_pts = current_pts if current_pts is not None else 50
+        if current_pts is None:
+            current_pts = await get_join_points(message.chat.id)
 
-        new_pts = max(0, min(100, current_pts + amount))
-        actual_change = new_pts - current_pts
+        if amount > 0 and current_pts + amount > BALANCE_MAX:
+            return await message.reply(
+                f"❌ Нельзя начислить столько баллов: будет превышен лимит <b>{BALANCE_MAX}</b>.\n"
+                f"Сейчас: <b>{current_pts}</b>, пытаешься начислить: <b>{amount}</b>, получилось бы: <b>{current_pts + amount}</b>."
+            )
+
+        if amount < 0 and current_pts + amount < BALANCE_MIN:
+            return await message.reply(
+                f"❌ Нельзя снять столько баллов: баланс не может быть меньше <b>{BALANCE_MIN}</b>.\n"
+                f"Сейчас: <b>{current_pts}</b>, пытаешься снять: <b>{abs(amount)}</b>, получилось бы: <b>{current_pts + amount}</b>."
+            )
+
+        new_pts = current_pts + amount
+        actual_change = amount
 
         await conn.execute(
             "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
@@ -540,7 +663,7 @@ async def change_points(message: types.Message):
 
 @dp.message(Command("инфо", "stats"))
 async def check_stats(message: types.Message):
-    if not await has_level(message.from_user.id, 1):
+    if not await has_level(message.from_user.id, message.chat.id, 1):
         return
 
     tid, tname = await get_target_id(message, message.text.split())
@@ -551,9 +674,10 @@ async def check_stats(message: types.Message):
                 "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
                 tid, message.chat.id
             )
-        points = points if points is not None else 50
-        user_link = silent_link(tname, tid)
+        if points is None:
+            points = await get_join_points(message.chat.id)
 
+        user_link = silent_link(tname, tid)
         await message.answer(
             f"<b>📊 Информация о пользователе</b>\n"
             f"👤 Имя: {user_link}\n"
@@ -583,7 +707,6 @@ async def process_top_pagination(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# ----------- Управление админами -----------
 @dp.message(Command("повысить", "promote"))
 async def promote_owner(message: types.Message):
     if message.from_user.id != OWNER_ID:
@@ -612,21 +735,24 @@ async def promote_owner(message: types.Message):
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO admins (user_id, level)
-            VALUES ($1, $2)
-            ON CONFLICT (user_id)
-            DO UPDATE SET level = $2
+            INSERT INTO admins (chat_id, user_id, level)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (chat_id, user_id)
+            DO UPDATE SET level = $3
             """,
-            tid, level
+            message.chat.id, tid, level
         )
 
-    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ {level}</b> уровня.")
+    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ {level}</b> уровня (в этом чате).")
 
 
 @dp.message(Command("админ", "admin"))
 async def make_admin_lvl1(message: types.Message):
     issuer_id = message.from_user.id
-    if issuer_id != OWNER_ID and not await has_level(issuer_id, 2):
+    issuer_is_owner = (issuer_id == OWNER_ID)
+    issuer_is_lvl2 = await has_level(issuer_id, message.chat.id, 2)
+
+    if not issuer_is_owner and not issuer_is_lvl2:
         return
 
     args = message.text.split()
@@ -638,28 +764,31 @@ async def make_admin_lvl1(message: types.Message):
         return await message.reply("❌ Нельзя менять права владельца.")
 
     async with pool.acquire() as conn:
-        current = await conn.fetchval("SELECT level FROM admins WHERE user_id = $1", tid)
+        current = await conn.fetchval(
+            "SELECT level FROM admins WHERE chat_id = $1 AND user_id = $2",
+            message.chat.id, tid
+        )
         if current == 2:
-            return await message.answer(f"ℹ️ {silent_link(name, tid)} уже <b>админ 2</b> уровня.")
+            return await message.answer(f"ℹ️ {silent_link(name, tid)} уже <b>админ 2</b> уровня (в этом чате).")
 
         await conn.execute(
             """
-            INSERT INTO admins (user_id, level)
-            VALUES ($1, 1)
-            ON CONFLICT (user_id)
+            INSERT INTO admins (chat_id, user_id, level)
+            VALUES ($1, $2, 1)
+            ON CONFLICT (chat_id, user_id)
             DO UPDATE SET level = GREATEST(admins.level, 1)
             """,
-            tid
+            message.chat.id, tid
         )
 
-    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ 1</b> уровня.")
+    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ 1</b> уровня (в этом чате).")
 
 
 @dp.message(Command("разжаловать", "unadmin"))
 async def remove_admin(message: types.Message):
     issuer_id = message.from_user.id
     issuer_is_owner = (issuer_id == OWNER_ID)
-    issuer_is_lvl2 = await has_level(issuer_id, 2)
+    issuer_is_lvl2 = await has_level(issuer_id, message.chat.id, 2)
 
     if not issuer_is_owner and not issuer_is_lvl2:
         return
@@ -673,23 +802,28 @@ async def remove_admin(message: types.Message):
         return await message.reply("❌ Нельзя разжаловать владельца.")
 
     async with pool.acquire() as conn:
-        current = await conn.fetchval("SELECT level FROM admins WHERE user_id = $1", tid)
+        current = await conn.fetchval(
+            "SELECT level FROM admins WHERE chat_id = $1 AND user_id = $2",
+            message.chat.id, tid
+        )
 
         if not current:
-            return await message.answer("ℹ️ Этот пользователь не админ.")
+            return await message.answer("ℹ️ Этот пользователь не админ (в этом чате).")
 
         if not issuer_is_owner and current >= 2:
-            return await message.reply("❌ Ты можешь снимать только <b>админа 1</b> уровня.")
+            return await message.reply("❌ Ты можешь снимать только <b>админа 1</b> уровня (в этом чате).")
 
-        await conn.execute("DELETE FROM admins WHERE user_id = $1", tid)
+        await conn.execute(
+            "DELETE FROM admins WHERE chat_id = $1 AND user_id = $2",
+            message.chat.id, tid
+        )
 
-    await message.answer(f"❌ {silent_link(name, tid)} больше <b>не админ</b>.")
+    await message.answer(f"❌ {silent_link(name, tid)} больше <b>не админ</b> (в этом чате).")
 
 
-# ---------------------- /бадмины ----------------------
 @dp.message(Command("бадмины", "badmins"))
 async def list_admins(message: types.Message):
-    if message.from_user.id != OWNER_ID and not await has_level(message.from_user.id, 2):
+    if message.from_user.id != OWNER_ID and not await has_level(message.from_user.id, message.chat.id, 2):
         return
 
     async with pool.acquire() as conn:
@@ -700,19 +834,16 @@ async def list_admins(message: types.Message):
                 u.name,
                 u.username
             FROM admins a
-            LEFT JOIN (
-                SELECT DISTINCT ON (user_id)
-                    user_id, name, username
-                FROM users
-                ORDER BY user_id, chat_id DESC
-            ) u ON u.user_id = a.user_id
+            LEFT JOIN users u
+                ON u.user_id = a.user_id AND u.chat_id = a.chat_id
+            WHERE a.chat_id = $1
             ORDER BY a.level DESC, a.user_id ASC
-        """)
+        """, message.chat.id)
 
     if not rows:
-        return await message.answer("Список админов пуст.")
+        return await message.answer("Список админов пуст (в этом чате).")
 
-    lines = ["<b>🛡 Список админов</b>\n"]
+    lines = ["<b>🛡 Список админов (в этом чате)</b>\n"]
     for i, r in enumerate(rows, 1):
         name = r["name"] or "Без имени"
         username = r["username"]
@@ -739,7 +870,6 @@ async def auto_update(message: types.Message):
         )
 
 
-# ---------------------- Main ----------------------
 async def main():
     print(">>> Бот запущен!")
     await init_db()
