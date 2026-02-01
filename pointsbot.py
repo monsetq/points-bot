@@ -68,6 +68,7 @@ async def init_db():
         FROM chat_settings cs
         WHERE u.chat_id = cs.chat_id AND u.points = 0
         """)
+
         await conn.execute("""
         UPDATE users
         SET points = 50
@@ -231,17 +232,20 @@ async def bot_added_auto_admin(event: types.ChatMemberUpdated):
             await update_user_data(inviter.id, chat_id, inviter.first_name, inviter.username)
 
             async with pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO admins (chat_id, user_id, level)
-                    VALUES ($1, $2, 2)
-                    ON CONFLICT (chat_id, user_id)
-                    DO UPDATE SET level = GREATEST(admins.level, 2)
-                """, chat_id, inviter.id)
+                res = await conn.execute(
+                    "UPDATE admins SET level = GREATEST(level, 2) WHERE chat_id = $1 AND user_id = $2",
+                    chat_id, inviter.id
+                )
+                if res.endswith("UPDATE 0"):
+                    await conn.execute(
+                        "INSERT INTO admins (chat_id, user_id, level) VALUES ($1, $2, 2)",
+                        chat_id, inviter.id
+                    )
 
             try:
                 await bot.send_message(
                     chat_id,
-                    f"🛡 {silent_link(inviter.first_name, inviter.id)} получил <b>админ 2</b> уровня (добавил бота).",
+                    f"🛡 {silent_link(inviter.first_name, inviter.id)} получил <b>админ 2</b> уровня.",
                     disable_web_page_preview=True
                 )
             except Exception:
@@ -271,7 +275,7 @@ async def cmd_help(message: types.Message):
             "• /передать [число] @user — передать\n\n"
             "🛡 <b>Администрирование:</b>\n"
             "• /балл [+/- число] @user [причина] — начислить/снять\n"
-            "• /инфо @user — посмотреть баланс баллов участника\n\n"
+            "• /инфо @user — чекнуть баланс\n\n"
             "⚙️ <b>Настройки чата:</b>\n"
             "• /стартбаллы [число] — стартовые баллы\n\n"
             "🛡 <b>Админка:</b>\n"
@@ -286,7 +290,7 @@ async def cmd_help(message: types.Message):
             "• /моиб — баланс\n"
             "• /топб — топ\n"
             "• /передать [число] @user — передать\n\n"
-            "• /инфо @user — посмотреть баланс баллов участника\n"
+            "• /инфо @user — посмотреть\n"
             "• /балл [+/- число] @user [причина]\n\n"
             "⚙️ <b>Настройки чата:</b>\n"
             "• /стартбаллы [число]\n\n"
@@ -302,14 +306,16 @@ async def cmd_help(message: types.Message):
             "• /моиб — баланс\n"
             "• /топб — топ\n"
             "• /передать [число] @user — передать\n"
-            "• /инфо @user — посмотреть баланс баллов участника\n"
+            "🕹 <b>Доступ:</b>\n"
+            "• /инфо @user — посмотреть\n"
         )
     else:
         text = (
             "<b>👤 МЕНЮ УЧАСТНИКА</b>\n\n"
             "• /моиб — баланс\n"
             "• /топб — топ\n"
-            "• /передать [число] @user — передать\n"
+            "• /передать [число] @user — передать баллы другому участнику\n\n"
+            "<i>Чтобы попасть в топ, проявляйте активность в чате!</i>"
         )
     await message.answer(text)
 
@@ -345,7 +351,7 @@ async def set_join_points(message: types.Message):
             DO UPDATE SET join_points = $2
         """, message.chat.id, jp)
 
-    await message.reply(f"✅ Стартовые баллы в этом чате установлены на <b>{jp}</b>.")
+    await message.reply(f"✅ Стартовые баллы установлены на <b>{jp}</b>.")
 
 
 @dp.message(Command("моиб", "myb"))
@@ -417,7 +423,7 @@ async def transfer_points(message: types.Message):
         return await message.reply(
             f"❌ Перевод невозможен: у получателя будет больше <b>{BALANCE_MAX}</b> баллов.\n"
             f"Сейчас у получателя: <b>{target_pts}</b>.\n"
-            f"Он может принять максимум: <b>{can}</b> балл(ов).\n"
+            f"Он может принять максимум: <b>{can}</b>.\n"
             f"Ты хотел перевести (получит): <b>{received_raw}</b>."
         )
 
@@ -732,15 +738,15 @@ async def promote_owner(message: types.Message):
         return await message.reply("❌ Нельзя менять права владельца.")
 
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO admins (chat_id, user_id, level)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (chat_id, user_id)
-            DO UPDATE SET level = $3
-            """,
+        res = await conn.execute(
+            "UPDATE admins SET level = $3 WHERE chat_id = $1 AND user_id = $2",
             message.chat.id, tid, level
         )
+        if res.endswith("UPDATE 0"):
+            await conn.execute(
+                "INSERT INTO admins (chat_id, user_id, level) VALUES ($1, $2, $3)",
+                message.chat.id, tid, level
+            )
 
     await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ {level}</b> уровня.")
 
@@ -770,15 +776,15 @@ async def make_admin_lvl1(message: types.Message):
         if current == 2:
             return await message.answer(f"ℹ️ {silent_link(name, tid)} уже <b>админ 2</b> уровня.")
 
-        await conn.execute(
-            """
-            INSERT INTO admins (chat_id, user_id, level)
-            VALUES ($1, $2, 1)
-            ON CONFLICT (chat_id, user_id)
-            DO UPDATE SET level = GREATEST(admins.level, 1)
-            """,
+        res = await conn.execute(
+            "UPDATE admins SET level = GREATEST(level, 1) WHERE chat_id = $1 AND user_id = $2",
             message.chat.id, tid
         )
+        if res.endswith("UPDATE 0"):
+            await conn.execute(
+                "INSERT INTO admins (chat_id, user_id, level) VALUES ($1, $2, 1)",
+                message.chat.id, tid
+            )
 
     await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ 1</b> уровня.")
 
