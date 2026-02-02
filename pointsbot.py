@@ -417,7 +417,6 @@ async def get_my_stats_text(user_id: int, chat_id: int) -> str:
 def build_help(role: str, lvl: int, join_points: int) -> str:
     header = (
         "<b>📖 Команды бота</b>\n"
-        "💠 Правила рейтинга | кнопка <b>«💠 О рейтинге»</b> в меню\n\n"
     )
 
     common = (
