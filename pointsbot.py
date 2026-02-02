@@ -108,6 +108,17 @@ def to_utf16_entities(text: str, entities: list[types.MessageEntity]) -> list[ty
     return out
 
 
+def emoji_variants(s: str) -> list[str]:
+    vs16 = "\ufe0f"
+    base = s.replace(vs16, "")
+    with_vs = base + vs16
+    out = []
+    for x in (s, base, with_vs):
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
 async def send_rich(message_or_cbmsg, rich: RichText, reply_markup=None, edit: bool = False):
     """
     Универсальная отправка/редактирование: всегда entities.
@@ -200,13 +211,14 @@ async def apply_custom_emojis(chat_id: int, text: str, entities: List[types.Mess
             continue
         if not emoji_text:
             continue
-        start = 0
-        while True:
-            idx = text.find(emoji_text, start)
-            if idx == -1:
-                break
-            matches.append((idx, idx + len(emoji_text), emoji_text, custom_id))
-            start = idx + len(emoji_text)
+        for key in emoji_variants(emoji_text):
+            start = 0
+            while True:
+                idx = text.find(key, start)
+                if idx == -1:
+                    break
+                matches.append((idx, idx + len(key), key, custom_id))
+                start = idx + len(key)
 
     if not matches:
         return text, entities
