@@ -571,7 +571,7 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
         await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
-@dp.message(Command("start", "help", "bhelp", "бпомощь", "меню", "menu"))
+@dp.message(Command("start", "bhelp", "бпомощь", "менюб", "menub"))
 async def cmd_menu(message: types.Message):
     await update_user_data(
         message.from_user.id,
