@@ -32,6 +32,99 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 pool = None
 
 
+# ------------------ Роли по баллам ------------------
+POINT_ROLES = [
+    (0, 49, "😈 Плохиш"),
+    (50, 69, "👌 Нормис"),
+    (70, 100, "🔥 Крутыш"),
+]
+
+
+def get_point_role(points: int) -> str:
+    for mn, mx, title in POINT_ROLES:
+        if mn <= points <= mx:
+            return title
+    if points < POINT_ROLES[0][0]:
+        return POINT_ROLES[0][2]
+    return POINT_ROLES[-1][2]
+
+
+def calc_punishment_adjust(points: int) -> tuple[int, int]:
+    """
+    Возвращает (mute_minutes_delta, warn_days_delta)
+      +  = усилить наказание
+      -  = смягчить наказание
+      0  = без изменений
+
+    Твои правила:
+    - points >= 70:
+        каждые 4 балла от 70 -> -5 минут мута (макс -30 минут)
+        каждые 7 баллов от 70 -> -1 день варна (макс -3 дня)
+    - points < 50:
+        каждый 1 балл до 50 -> +5 минут мута
+        каждые 2 балла до 50 -> +1 день варна
+    """
+    if points >= 70:
+        over = points - 70
+        mute_reduce = min(30, (over // 4) * 5)
+        warn_reduce = min(3, (over // 7) * 1)
+        return -mute_reduce, -warn_reduce
+
+    if points < 50:
+        lack = 50 - points
+        mute_add = lack * 5
+        warn_add = (lack // 2) * 1
+        return mute_add, warn_add
+
+    return 0, 0
+
+
+def fmt_minutes(delta: int) -> str:
+    if delta == 0:
+        return "без изменений"
+    sign = "+" if delta > 0 else "−"
+    return f"{sign}{abs(delta)} мин"
+
+
+def fmt_days(delta: int) -> str:
+    if delta == 0:
+        return "без изменений"
+    sign = "+" if delta > 0 else "−"
+    return f"{sign}{abs(delta)} дн"
+
+
+# ------------------ Текст "О рейтинге" ------------------
+RATING_INFO_TEXT = (
+    "<b>💠 Социальный рейтинг</b>\n\n"
+    "• Влияет на наказания и статус в чате\n"
+    f"• Старт | <b>50</b> (макс. <b>{BALANCE_MAX}</b>)\n\n"
+    "<b>📈 Высокий рейтинг</b>\n"
+    "• наказания мягче\n"
+    "• доступны бонусы и фишки\n\n"
+    "<b>📉 Низкий рейтинг</b>\n"
+    "• наказания строже\n"
+    "• нельзя стать администратором\n\n"
+    "<b>➕ Как получить</b>\n"
+    "• мероприятия\n"
+    "• высокая активность\n"
+    "• переводы от участников\n\n"
+    "<b>➖ За что снимают</b>\n"
+    "• нарушения правил\n\n"
+    "<b>♻️ Отработка</b>\n"
+    "• помощь на мероприятии\n"
+    "• высокая активность за сутки\n"
+    "<i>(доступна первые 48 часов)</i>\n\n"
+    "<b>💱 Баллы = валюта</b>\n"
+    "• снятие мута | <b>10</b>\n"
+    "• снятие варна | <b>15</b>\n"
+    "• разбан | <b>40</b>\n"
+    "<i>(тратить баллы нельзя, если их меньше 40)</i>\n\n"
+    f"<b>🔁 Переводы</b> | курс <b>{TRANSFER_RATE}:1</b>\n"
+    "<b>🧹 Обнуление</b> | раз в 2 месяца\n"
+)
+
+
+# ---------------------- DB ----------------------
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL)
@@ -63,6 +156,7 @@ async def init_db():
         )
         """)
 
+        # миграция старой admins (если была)
         try:
             await conn.execute("""
             INSERT INTO admins_v2 (chat_id, user_id, level)
@@ -286,12 +380,14 @@ def get_role_and_lvl(user_id: int, lvl: int) -> str:
     return "member"
 
 
+# ---------------------- Меню ----------------------
 def main_menu_kb(owner_id: int):
     b = InlineKeyboardBuilder()
     b.button(text="📖 Команды", callback_data=f"menu:{owner_id}:help")
+    b.button(text="💠 О рейтинге", callback_data=f"menu:{owner_id}:rating")
     b.button(text="🏆 Топ", callback_data=f"menu:{owner_id}:top:0")
     b.button(text="📊 Моя статистика", callback_data=f"menu:{owner_id}:stats")
-    b.adjust(1, 2)
+    b.adjust(2, 2)
     return b.as_markup()
 
 
@@ -313,24 +409,26 @@ async def get_my_stats_text(user_id: int, chat_id: int) -> str:
     place = (int(higher) + 1) if higher is not None else 1
     total = int(total) if total is not None else 0
 
+    status = get_point_role(int(points))
+    mute_delta, warn_delta = calc_punishment_adjust(int(points))
+
     return (
         "<b>📊 Моя статистика</b>\n"
         f"💠 Баланс | <b>{points}</b>\n"
-        f"🏅 Место | <b>{place}</b> из <b>{total}</b>\n"
+        f"😎 Статус | <b>{status}</b>\n"
+        f"🏅 Место | <b>{place}</b> из <b>{total}</b>\n\n"
+        "<b>⏱ Коррекция наказания</b>\n"
+        f"🔇 Мут | <b>{fmt_minutes(mute_delta)}</b>\n"
+        f"⚠️ Варн | <b>{fmt_days(warn_delta)}</b>\n"
     )
 
 
 def build_help(role: str, lvl: int, join_points: int) -> str:
+    # без “старт/лимит/курс” в шапке — только по делу
     header = (
-        "╭─ <b>💠 Меню бота баллов</b>\n"
-        f"├ 🎁 Старт | <b>{join_points}</b>\n"
-        f"├ 🔒 Лимит | <b>{BALANCE_MIN}</b>–<b>{BALANCE_MAX}</b>\n"
-        f"╰ 🔁 Курс | <b>{TRANSFER_RATE}:1</b>\n"
+        "<b>📖 Команды бота</b>\n"
+        "💠 Правила рейтинга | кнопка <b>«💠 О рейтинге»</b> в меню\n\n"
     )
-
-    if role in ("admin1", "admin2", "owner"):
-        header += f"\n🌐 <b>Уровень</b> | {lvl}\n"
-    header += "\n"
 
     common = (
         "<b>👤 Участнику</b>\n"
@@ -344,7 +442,7 @@ def build_help(role: str, lvl: int, join_points: int) -> str:
 
     admin1 = (
         "\n<b>🌐 Админу 1 уровня</b>\n"
-        "• <b>/инфо</b> | баланс участника\n"
+        "• <b>/инфо</b> | информация по участнику\n"
     )
 
     if role == "admin1":
@@ -408,12 +506,12 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
 
     res = [f"💠 <b>ТОП ЛИДЕРОВ</b> <i>({page + 1}/{total_pages})</i>\n"]
     for i, row in enumerate(top, 1 + offset):
-        uid, name, pts, username = row["user_id"], row["name"], row["points"], row["username"]
+        name, pts, username = row["name"], row["points"], row["username"]
         if username:
             user_link = hlink(name, f"https://t.me/{username}")
         else:
             user_link = name
-        res.append(f"{i}. {user_link} — {hbold(pts)}")
+        res.append(f"{i}. {user_link} | {hbold(pts)}")
 
     text = "\n".join(res)
     kb = get_top_keyboard(page, total_pages, owner_id)
@@ -424,6 +522,7 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
         await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
+# ---------------------- Handlers ----------------------
 @dp.message(Command("start", "help", "bhelp", "бпомощь", "меню", "menu"))
 async def cmd_menu(message: types.Message):
     await update_user_data(
@@ -432,13 +531,8 @@ async def cmd_menu(message: types.Message):
         message.from_user.first_name,
         message.from_user.username
     )
-
-    lvl = await get_admin_level(message.from_user.id, message.chat.id)
-    role = get_role_and_lvl(message.from_user.id, lvl)
-
-    text = "<b>💠 Меню бота баллов</b>\nВыбери раздел кнопками ниже."
     await message.answer(
-        text,
+        "<b>💠 Меню бота баллов</b>\nВыбери раздел кнопками ниже.",
         reply_markup=main_menu_kb(message.from_user.id),
         disable_web_page_preview=True
     )
@@ -459,9 +553,8 @@ async def menu_handler(callback: types.CallbackQuery):
     jp = await get_join_points(callback.message.chat.id)
 
     if action == "main":
-        text = "<b>💠 Меню бота баллов</b>\nВыбери раздел кнопками ниже."
         await callback.message.edit_text(
-            text,
+            "<b>💠 Меню бота баллов</b>\nВыбери раздел кнопками ниже.",
             reply_markup=main_menu_kb(owner_id),
             disable_web_page_preview=True
         )
@@ -471,6 +564,14 @@ async def menu_handler(callback: types.CallbackQuery):
         text = build_help(role, lvl, jp)
         await callback.message.edit_text(
             text,
+            reply_markup=main_menu_kb(owner_id),
+            disable_web_page_preview=True
+        )
+        return await callback.answer()
+
+    if action == "rating":
+        await callback.message.edit_text(
+            RATING_INFO_TEXT,
             reply_markup=main_menu_kb(owner_id),
             disable_web_page_preview=True
         )
@@ -508,7 +609,7 @@ async def set_join_points_cmd(message: types.Message):
     try:
         jp = int(args[1])
     except ValueError:
-        return await message.reply("Введите число. Пример: <b>/стартбаллы</b> 50")
+        return await message.reply("Введите число. Используй | <b>/стартбаллы</b> 50")
 
     jp = max(BALANCE_MIN, min(BALANCE_MAX, jp))
 
@@ -533,7 +634,18 @@ async def my_points(message: types.Message):
         )
     if points is None:
         points = await get_join_points(message.chat.id)
-    await message.reply(f"💠 {message.from_user.first_name} | у тебя <b>{points}</b> баллов.")
+
+    status = get_point_role(int(points))
+    mute_delta, warn_delta = calc_punishment_adjust(int(points))
+
+    await message.reply(
+        f"💠 {message.from_user.first_name}\n"
+        f"Баланс | <b>{points}</b>\n"
+        f"Статус | <b>{status}</b>\n\n"
+        f"🔇 Мут | <b>{fmt_minutes(mute_delta)}</b>\n"
+        f"⚠️ Варн | <b>{fmt_days(warn_delta)}</b>",
+        disable_web_page_preview=True
+    )
 
 
 @dp.message(Command("инфо", "stats"))
@@ -561,10 +673,17 @@ async def check_stats(message: types.Message):
         points = await get_join_points(message.chat.id)
 
     user_link = silent_link(tname, tid)
+    status = get_point_role(int(points))
+    mute_delta, warn_delta = calc_punishment_adjust(int(points))
+
     await message.answer(
         f"<b>📊 Информация</b>\n"
         f"👤 Пользователь | {user_link}\n"
-        f"💠 Баланс | <b>{points}</b>",
+        f"💠 Баланс | <b>{points}</b>\n"
+        f"😎 Статус | <b>{status}</b>\n\n"
+        f"<b>⏱ Коррекция наказания по баллам</b>\n"
+        f"🔇 Мут | <b>{fmt_minutes(mute_delta)}</b>\n"
+        f"⚠️ Варн | <b>{fmt_days(warn_delta)}</b>",
         disable_web_page_preview=True
     )
 
@@ -587,6 +706,7 @@ async def process_top_pagination(callback: types.CallbackQuery):
     await callback.answer()
 
 
+# ---------------------- Transfer / Points logic (ниже твой код без ломки) ----------------------
 @dp.message(Command("передать", "pay"))
 async def transfer_points(message: types.Message):
     await update_user_data(
@@ -756,23 +876,8 @@ async def transfer_confirm(callback: types.CallbackQuery):
 
     pending_transfers.pop(token, None)
 
-    try:
-        chat_title = callback.message.chat.title or str(req["chat_id"])
-    except Exception:
-        chat_title = str(req["chat_id"])
-
     sender_l = silent_link(req["sender_name"], req["sender_id"])
     target_l = silent_link(req["target_name"], req["target_id"])
-
-    await log_to_owner(
-        "🧾 <b>Лог перевода баллов</b>\n"
-        f"🏷 Чат | <b>{chat_title}</b> (<code>{req['chat_id']}</code>)\n"
-        f"👤 Отправитель | {sender_l} (<code>{req['sender_id']}</code>)\n"
-        f"🎯 Получатель | {target_l} (<code>{req['target_id']}</code>)\n"
-        f"📈 Получено | <b>{actual_received}</b>\n"
-        f"📉 Списано | <b>{actual_spent}</b> (курс {TRANSFER_RATE}:1)\n"
-        f"💠 После | отправитель <b>{new_sender}</b> | получатель <b>{new_target}</b>"
-    )
 
     await callback.message.edit_text(
         f"✅ Перевод выполнен!\n"
