@@ -469,7 +469,6 @@ async def get_my_stats_text(user_id: int, chat_id: int) -> str:
 def build_help(role: str, lvl: int, join_points: int) -> str:
     header = (
         "<b>📖 Команды бота</b>\n"
-        "💠 Правила рейтинга | кнопка <b>«💠 О рейтинге»</b> в меню\n\n"
     )
 
     common = (
@@ -499,6 +498,7 @@ def build_help(role: str, lvl: int, join_points: int) -> str:
         "• <b>/повысить</b> | выдать админа 2 уровня\n"
         "• <b>/разжаловать</b> | снять админку\n"
         "• <b>/бадмины</b> | список админов\n"
+        "• <b>+рейтинг</b> | изменить содержимое «О рейтинге»\n"
     )
 
     if role == "owner":
