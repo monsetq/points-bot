@@ -12,6 +12,7 @@ from aiogram.utils.markdown import hbold, hlink
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "1875573844"))
+MENTION_IN_TOP_USER_ID = 1183110737
 
 MIN_POINTS_TO_TRANSFER = 50
 TRANSFER_RATE = 3
@@ -495,12 +496,22 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
 
     res = [f"💠 <b>ТОП ЛИДЕРОВ</b> <i>({page + 1}/{total_pages})</i>\n"]
     for i, row in enumerate(top, 1 + offset):
-        name, pts, username = row["name"], row["points"], row["username"]
-        if username:
-            user_link = hlink(name, f"https://t.me/{username}")
+        uid = row["user_id"]
+        name = row["name"]
+        pts = row["points"]
+        username = row["username"]
+    
+        if uid == MENTION_IN_TOP_USER_ID:
+            user_link = f'<a href="tg://user?id={uid}">{name}</a>'
         else:
-            user_link = name
+            if username:
+                user_link = hlink(name, f"https://t.me/{username}")
+            else:
+                user_link = name
+
         res.append(f"{i}. {user_link} | {hbold(pts)}")
+
+
 
     text = "\n".join(res)
     kb = get_top_keyboard(page, total_pages, owner_id)
@@ -682,7 +693,19 @@ async def check_stats(message: types.Message):
 
 @dp.message(Command("топб", "topb"))
 async def show_top_command(message: types.Message):
-    await send_top_page(message, 0, owner_id=message.from_user.id)
+    args = message.text.split()
+    page = 0
+
+    if len(args) >= 2:
+        try:
+            page = int(args[1]) - 1
+        except ValueError:
+            page = 0
+
+    if page < 0:
+        page = 0
+
+    await send_top_page(message, page, owner_id=message.from_user.id)
 
 
 @dp.callback_query(F.data.startswith("top:"))
