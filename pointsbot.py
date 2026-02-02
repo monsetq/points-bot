@@ -39,7 +39,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 pool = None
 
 
-PLACEHOLDER = "⬜" 
+PLACEHOLDER = " " 
 
 @dataclass
 class RichText:
