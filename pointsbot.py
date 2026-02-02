@@ -87,6 +87,27 @@ class RichText:
         return self
 
 
+def u16len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+def to_utf16_entities(text: str, entities: list[types.MessageEntity]) -> list[types.MessageEntity]:
+    """
+    Конвертирует offsets/length из python-индексов (len)
+    в UTF-16 units (как требует Telegram).
+    """
+    out = []
+    for e in entities:
+        d = e.model_dump()
+        py_off = int(d.get("offset", 0))
+        py_len = int(d.get("length", 0))
+
+        d["offset"] = u16len(text[:py_off])
+        d["length"] = u16len(text[py_off:py_off + py_len])
+
+        out.append(types.MessageEntity(**d))
+    return out
+
+
 async def send_rich(message_or_cbmsg, rich: RichText, reply_markup=None, edit: bool = False):
     """
     Универсальная отправка/редактирование: всегда entities.
@@ -97,6 +118,8 @@ async def send_rich(message_or_cbmsg, rich: RichText, reply_markup=None, edit: b
         text=rich.text,
         entities=rich.entities
     )
+
+    final_entities = to_utf16_entities(final_text, final_entities)
 
     if edit:
         await message_or_cbmsg.edit_text(
@@ -113,7 +136,7 @@ async def send_rich(message_or_cbmsg, rich: RichText, reply_markup=None, edit: b
     reply_markup=reply_markup,
     disable_web_page_preview=True,
     parse_mode=None
-        ) 
+        )
 
 
 _EMOJI_CACHE: Dict[int, Tuple[float, Dict[str, Tuple[str, bool]]]] = {}
@@ -1580,14 +1603,20 @@ async def list_admins(message: types.Message):
 
 
 @dp.message(F.entities)
-async def catch_custom_emoji_id(message: types.Message):
+async def catch_custom_emoji_id_private_only(message: types.Message):
+    if message.chat.type != "private":
+        return 
+
+    if not message.entities:
+        return
+
+    ids = []
     for ent in message.entities:
-        if ent.type == "custom_emoji":
-            await message.reply(
-                f"🆔 custom_emoji_id:\n<code>{ent.custom_emoji_id}</code>",
-                parse_mode="HTML"
-            )
-            return
+        if ent.type == "custom_emoji" and ent.custom_emoji_id:
+            ids.append(ent.custom_emoji_id)
+
+    if ids:
+        await message.answer("custom_emoji_id:\n" + "\n".join(ids), parse_mode=None)
 
 
 @dp.message()
