@@ -4,11 +4,12 @@ import os
 import asyncpg
 import time
 import secrets
+from dataclasses import dataclass
+from typing import Optional, Tuple, List, Dict
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.utils.markdown import hbold, hlink
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "1875573844"))
@@ -34,6 +35,229 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 pool = None
 
 
+PLACEHOLDER = "⬜" 
+
+@dataclass
+class RichText:
+    parts: List[str]
+    entities: List[types.MessageEntity]
+
+    def __init__(self):
+        self.parts = []
+        self.entities = []
+
+    @property
+    def text(self) -> str:
+        return "".join(self.parts)
+
+    def add(self, s: str) -> "RichText":
+        self.parts.append(str(s))
+        return self
+
+    def bold(self, s: str) -> "RichText":
+        s = str(s)
+        off = len(self.text)
+        self.parts.append(s)
+        self.entities.append(types.MessageEntity(type="bold", offset=off, length=len(s)))
+        return self
+
+    def italic(self, s: str) -> "RichText":
+        s = str(s)
+        off = len(self.text)
+        self.parts.append(s)
+        self.entities.append(types.MessageEntity(type="italic", offset=off, length=len(s)))
+        return self
+
+    def code(self, s: str) -> "RichText":
+        s = str(s)
+        off = len(self.text)
+        self.parts.append(s)
+        self.entities.append(types.MessageEntity(type="code", offset=off, length=len(s)))
+        return self
+
+    def link(self, label: str, url: str) -> "RichText":
+        label = str(label)
+        off = len(self.text)
+        self.parts.append(label)
+        self.entities.append(types.MessageEntity(type="text_link", offset=off, length=len(label), url=str(url)))
+        return self
+
+
+async def send_rich(message_or_cbmsg, rich: RichText, reply_markup=None, edit: bool = False):
+    """
+    Универсальная отправка/редактирование: всегда entities.
+    Перед отправкой автоматически заменяет настроенные эмодзи на custom_emoji.
+    """
+    final_text, final_entities = await apply_custom_emojis(
+        chat_id=message_or_cbmsg.chat.id,
+        text=rich.text,
+        entities=rich.entities
+    )
+
+    if edit:
+        await message_or_cbmsg.edit_text(
+            final_text,
+            entities=final_entities,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+    else:
+        await message_or_cbmsg.answer(
+            final_text,
+            entities=final_entities,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
+
+
+_EMOJI_CACHE: Dict[int, Tuple[float, Dict[str, Tuple[str, bool]]]] = {}
+_EMOJI_CACHE_TTL = 10.0 
+
+async def get_emoji_map(chat_id: int) -> Dict[str, Tuple[str, bool]]:
+    """
+    returns dict: emoji_text -> (custom_emoji_id, enabled)
+    """
+    now = time.time()
+    cached = _EMOJI_CACHE.get(chat_id)
+    if cached and (now - cached[0]) < _EMOJI_CACHE_TTL:
+        return cached[1]
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT emoji_text, custom_emoji_id, enabled FROM chat_emojis WHERE chat_id = $1",
+            chat_id
+        )
+
+    m: Dict[str, Tuple[str, bool]] = {}
+    for r in rows:
+        et = str(r["emoji_text"])
+        cid = r["custom_emoji_id"]
+        en = bool(r["enabled"])
+        if cid:
+            m[et] = (str(cid), en)
+
+    _EMOJI_CACHE[chat_id] = (now, m)
+    return m
+
+
+def _shift_entities(entities: List[types.MessageEntity], start: int, delta: int):
+    """
+    Сдвигает offset всех entities, которые начинаются ПОСЛЕ start.
+    delta может быть отрицательным.
+    """
+    if delta == 0:
+        return
+    for e in entities:
+        if e.offset > start:
+            e.offset += delta
+
+
+def _overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
+    return not (a_end <= b_start or b_end <= a_start)
+
+
+async def apply_custom_emojis(chat_id: int, text: str, entities: List[types.MessageEntity]) -> Tuple[str, List[types.MessageEntity]]:
+    """
+    Автоматически заменяет ВСЕ настроенные emoji_text на custom_emoji entities.
+    Важно: работает с уже существующими entities (bold/link/etc), корректно двигает offset.
+    """
+    emoji_map = await get_emoji_map(chat_id)
+    if not emoji_map:
+        return text, entities
+
+    matches = []
+    for emoji_text, (custom_id, enabled) in emoji_map.items():
+        if not enabled or not custom_id:
+            continue
+        if not emoji_text:
+            continue
+        start = 0
+        while True:
+            idx = text.find(emoji_text, start)
+            if idx == -1:
+                break
+            matches.append((idx, idx + len(emoji_text), emoji_text, custom_id))
+            start = idx + len(emoji_text)
+
+    if not matches:
+        return text, entities
+
+    matches.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+    selected = []
+    for m in matches:
+        s, e, emj, cid = m
+        ok = True
+        for ss, ee, _, _ in selected:
+            if _overlaps(s, e, ss, ee):
+                ok = False
+                break
+        if ok:
+            selected.append(m)
+
+    selected.sort(key=lambda x: x[0], reverse=True)
+
+    ents = [types.MessageEntity(**e.model_dump()) for e in entities]
+
+    for s, e, emoji_text, custom_id in selected:
+        before = text[:s]
+        after = text[e:]
+        text = before + PLACEHOLDER + after
+
+        delta = 1 - len(emoji_text)
+
+        _shift_entities(ents, s, delta)
+
+        ents.append(types.MessageEntity(
+            type="custom_emoji",
+            offset=s,
+            length=1,
+            custom_emoji_id=str(custom_id)
+        ))
+
+    ents.sort(key=lambda x: x.offset)
+    return text, ents
+
+
+async def set_chat_emoji(chat_id: int, emoji_text: str, custom_emoji_id: str, enabled: bool = True):
+    emoji_text = (emoji_text or "").strip()
+    custom_emoji_id = (custom_emoji_id or "").strip()
+    if not emoji_text:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO chat_emojis (chat_id, emoji_text, custom_emoji_id, enabled)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (chat_id, emoji_text)
+            DO UPDATE SET custom_emoji_id = EXCLUDED.custom_emoji_id,
+                          enabled = EXCLUDED.enabled
+        """, chat_id, emoji_text, custom_emoji_id, bool(enabled))
+    _EMOJI_CACHE.pop(chat_id, None)
+
+
+async def toggle_chat_emoji(chat_id: int, emoji_text: str, enabled: bool):
+    emoji_text = (emoji_text or "").strip()
+    if not emoji_text:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO chat_emojis (chat_id, emoji_text, custom_emoji_id, enabled)
+            VALUES ($1, $2, NULL, $3)
+            ON CONFLICT (chat_id, emoji_text)
+            DO UPDATE SET enabled = EXCLUDED.enabled
+        """, chat_id, emoji_text, bool(enabled))
+    _EMOJI_CACHE.pop(chat_id, None)
+
+
+async def delete_chat_emoji(chat_id: int, emoji_text: str):
+    emoji_text = (emoji_text or "").strip()
+    if not emoji_text:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM chat_emojis WHERE chat_id = $1 AND emoji_text = $2", chat_id, emoji_text)
+    _EMOJI_CACHE.pop(chat_id, None)
+
+
 POINT_ROLES = [
     (0, 49, "😈 Плохиш"),
     (50, 69, "👌 Нормис"),
@@ -51,20 +275,6 @@ def get_point_role(points: int) -> str:
 
 
 def calc_punishment_adjust(points: int) -> tuple[int, int]:
-    """
-    Возвращает (mute_minutes_delta, warn_days_delta)
-      +  = усилить наказание
-      -  = смягчить наказание
-      0  = без изменений
-
-    Твои правила:
-    - points >= 70:
-        каждые 4 балла от 70 -> -5 минут мута (макс -30 минут)
-        каждые 7 баллов от 70 -> -1 день варна (макс -3 дня)
-    - points < 50:
-        каждый 1 балл до 50 -> +5 минут мута
-        каждые 2 балла до 50 -> +1 день варна
-    """
     if points >= 70:
         over = points - 70
         mute_reduce = min(30, (over // 4) * 5)
@@ -95,32 +305,32 @@ def fmt_days(delta: int) -> str:
 
 
 RATING_INFO_TEXT = (
-    "<b>💠 Социальный рейтинг</b>\n\n"
+    "💠 Социальный рейтинг\n\n"
     "• Влияет на наказания и статус в чате\n"
-    f"• Старт | <b>50</b> (макс. <b>{BALANCE_MAX}</b>)\n\n"
-    "<b>📈 Высокий рейтинг</b>\n"
+    f"• Старт | 50 (макс. {BALANCE_MAX})\n\n"
+    "📈 Высокий рейтинг\n"
     "• наказания мягче\n"
     "• доступны бонусы и фишки\n\n"
-    "<b>📉 Низкий рейтинг</b>\n"
+    "📉 Низкий рейтинг\n"
     "• наказания строже\n"
     "• нельзя стать администратором\n\n"
-    "<b>➕ Как получить</b>\n"
+    "➕ Как получить\n"
     "• мероприятия\n"
     "• высокая активность\n"
     "• переводы от участников\n\n"
-    "<b>➖ За что снимают</b>\n"
+    "➖ За что снимают\n"
     "• нарушения правил\n\n"
-    "<b>♻️ Отработка</b>\n"
+    "♻️ Отработка\n"
     "• помощь на мероприятии\n"
     "• высокая активность за сутки\n"
-    "<i>(доступна первые 48 часов)</i>\n\n"
-    "<b>💱 Баллы = валюта</b>\n"
-    "• снятие мута | <b>10</b>\n"
-    "• снятие варна | <b>15</b>\n"
-    "• разбан | <b>40</b>\n"
-    "<i>(тратить баллы нельзя, если их меньше 40)</i>\n\n"
-    f"<b>🔁 Переводы</b> | курс <b>{TRANSFER_RATE}:1</b>\n"
-    "<b>🧹 Обнуление</b> | раз в 2 месяца\n"
+    "(доступна первые 48 часов)\n\n"
+    "💱 Баллы = валюта\n"
+    "• снятие мута | 10\n"
+    "• снятие варна | 15\n"
+    "• разбан | 40\n"
+    "(тратить баллы нельзя, если их меньше 40)\n\n"
+    f"🔁 Переводы | курс {TRANSFER_RATE}:1\n"
+    "🧹 Обнуление | раз в 2 месяца\n"
 )
 
 
@@ -164,7 +374,6 @@ async def init_db():
             join_points INT NOT NULL DEFAULT 50
         )
         """)
-
         await conn.execute("ALTER TABLE chat_settings ADD COLUMN IF NOT EXISTS rating_text TEXT")
 
         await conn.execute("""
@@ -173,6 +382,16 @@ async def init_db():
             user_id BIGINT NOT NULL,
             level INT NOT NULL DEFAULT 1,
             PRIMARY KEY (chat_id, user_id)
+        )
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_emojis (
+            chat_id BIGINT NOT NULL,
+            emoji_text TEXT NOT NULL,
+            custom_emoji_id TEXT,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            PRIMARY KEY (chat_id, emoji_text)
         )
         """)
 
@@ -233,6 +452,7 @@ async def get_join_points(chat_id: int) -> int:
             return 50
         return int(jp)
 
+
 async def get_rating_text(chat_id: int) -> str:
     async with pool.acquire() as conn:
         txt = await conn.fetchval("SELECT rating_text FROM chat_settings WHERE chat_id = $1", chat_id)
@@ -256,7 +476,6 @@ async def set_rating_text(chat_id: int, new_text: str):
             chat_id,
             new_text
         )
-
 
 
 async def update_user_data(user_id: int, chat_id: int, name: str, username: str | None = None):
@@ -323,14 +542,6 @@ async def remove_admin_level(chat_id: int, user_id: int):
 
 
 async def resolve_target(message: types.Message, args: list):
-    """
-    Возвращает: (tid, name, username, err)
-    err:
-      None - ок
-      "no_target" - не указали
-      "not_found" - нигде не нашли username в БД
-      "not_in_chat" - нашли user_id глобально, но его нет в этом чате (или бот не смог проверить)
-    """
     if message.reply_to_message and message.reply_to_message.from_user:
         u = message.reply_to_message.from_user
         return u.id, u.first_name, u.username, None
@@ -375,10 +586,6 @@ async def resolve_target(message: types.Message, args: list):
     return tid, tname, tuname, None
 
 
-def silent_link(name, user_id):
-    return f'<a href="tg://user?id={user_id}">{name}</a>'
-
-
 async def log_to_owner(text: str):
     try:
         await bot.send_message(OWNER_ID, text, disable_web_page_preview=True)
@@ -389,18 +596,15 @@ async def log_to_owner(text: str):
 def extract_reason_from_args(args: list) -> str:
     if len(args) <= 2:
         return ""
-
     at_index = None
     for i, a in enumerate(args):
         if a.startswith("@"):
             at_index = i
             break
-
     if at_index is not None:
         reason_parts = args[at_index + 1:]
     else:
         reason_parts = args[2:]
-
     return " ".join(reason_parts).strip()
 
 
@@ -434,7 +638,26 @@ def main_menu_kb(owner_id: int):
     return b.as_markup()
 
 
-async def get_my_stats_text(user_id: int, chat_id: int) -> str:
+def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
+    builder = InlineKeyboardBuilder()
+    if current_page > 0:
+        builder.button(text="⬅️", callback_data=f"top:{user_id}:{current_page - 1}")
+    builder.button(text="🏠 Меню", callback_data=f"menu:{user_id}:main")
+    if current_page < total_pages - 1:
+        builder.button(text="➡️", callback_data=f"top:{user_id}:{current_page + 1}")
+    builder.adjust(3)
+    return builder.as_markup()
+
+
+def transfer_confirm_kb(token: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data=f"tconf:{token}")
+    builder.button(text="❌ Отмена", callback_data=f"tcancel:{token}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+async def build_my_stats(user_id: int, chat_id: int) -> RichText:
     async with pool.acquire() as conn:
         points = await conn.fetchval(
             "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
@@ -455,80 +678,51 @@ async def get_my_stats_text(user_id: int, chat_id: int) -> str:
     status = get_point_role(int(points))
     mute_delta, warn_delta = calc_punishment_adjust(int(points))
 
-    return (
-        "<b>📊 Моя статистика</b>\n"
-        f"💠 Баланс | <b>{points}</b>\n"
-        f"😎 Статус | <b>{status}</b>\n"
-        f"🏅 Место | <b>{place}</b> из <b>{total}</b>\n\n"
-        "<b>⏱ Коррекция наказания</b>\n"
-        f"🔇 Мут | <b>{fmt_minutes(mute_delta)}</b>\n"
-        f"⚠️ Варн | <b>{fmt_days(warn_delta)}</b>\n"
-    )
+    b = RichText()
+    b.add("📊 ").bold("Моя статистика").add("\n")
+    b.add("💠 Баланс | ").bold(points).add("\n")
+    b.add("😎 Статус | ").bold(status).add("\n")
+    b.add("🏅 Место | ").bold(place).add(" из ").bold(total).add("\n\n")
+    b.bold("⏱ Коррекция наказания").add("\n")
+    b.add("🔇 Мут | ").bold(fmt_minutes(mute_delta)).add("\n")
+    b.add("⚠️ Варн | ").bold(fmt_days(warn_delta)).add("\n")
+    return b
 
 
-def build_help(role: str, lvl: int, join_points: int) -> str:
-    header = (
-        "<b>📖 Команды бота</b>\n"
-    )
+def build_help(role: str) -> RichText:
+    b = RichText()
+    b.add("📖 ").bold("Команды бота").add("\n\n")
 
-    common = (
-        "<b>👤 Участнику</b>\n"
-        "• <b>/моиб</b> | баланс\n"
-        "• <b>/топб</b> | топ баллов\n"
-        "• <b>/передать</b> | перевод баллов\n"
-    )
+    b.bold("👤 Участнику").add("\n")
+    b.add("• /моиб | баланс\n")
+    b.add("• /топб | топ баллов\n")
+    b.add("• /передать | перевод баллов\n")
 
     if role == "member":
-        return header + common
+        return b
 
-    admin1 = (
-        "\n<b>🌐 Админу 1 уровня</b>\n"
-        "• <b>/инфо</b> | информация по участнику\n"
-    )
+    b.add("\n").bold("🌐 Админу 1 уровня").add("\n")
+    b.add("• /инфо | информация по участнику\n")
 
     if role == "admin1":
-        return header + common + admin1
+        return b
 
-    admin2 = (
-        "\n<b>🌐 Админу 2 уровня</b>\n"
-        "• <b>/балл</b> | начислить / снять баллы\n"
-        "• <b>/баллм</b> | массовое изменение\n"
-        "• <b>/стартбаллы</b> | стартовые баллы чата\n"
-        "• <b>/админ</b> | выдать админа 1 уровня\n"
-        "• <b>/повысить</b> | выдать админа 2 уровня\n"
-        "• <b>/разжаловать</b> | снять админку\n"
-        "• <b>/бадмины</b> | список админов\n"
-        "• <b>+рейтинг</b> | изменить содержимое «О рейтинге»\n"
-    )
+    b.add("\n").bold("🌐 Админу 2 уровня").add("\n")
+    b.add("• /балл | начислить / снять баллы\n")
+    b.add("• /баллм | массовое изменение\n")
+    b.add("• /стартбаллы | стартовые баллы чата\n")
+    b.add("• /админ | выдать админа 1 уровня\n")
+    b.add("• /повысить | выдать админа 2 уровня\n")
+    b.add("• /разжаловать | снять админку\n")
+    b.add("• /бадмины | список админов\n")
+    b.add("• +рейтинг | изменить «О рейтинге»\n")
+    b.add("• +эмодзи | настройка premium эмодзи\n")
 
     if role == "owner":
-        owner = "\n<b>👑 Владельцу</b>\n• Полный доступ в любом чате\n"
-        return header + owner + common + admin1 + admin2
+        b.add("\n").bold("👑 Владельцу").add("\n")
+        b.add("• Полный доступ в любом чате\n")
 
-    return header + common + admin1 + admin2
-
-
-def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
-    builder = InlineKeyboardBuilder()
-
-    if current_page > 0:
-        builder.button(text="⬅️", callback_data=f"top:{user_id}:{current_page - 1}")
-
-    builder.button(text="🏠 Меню", callback_data=f"menu:{user_id}:main")
-
-    if current_page < total_pages - 1:
-        builder.button(text="➡️", callback_data=f"top:{user_id}:{current_page + 1}")
-
-    builder.adjust(3)
-    return builder.as_markup()
-
-
-def transfer_confirm_kb(token: str):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Подтвердить", callback_data=f"tconf:{token}")
-    builder.button(text="❌ Отмена", callback_data=f"tcancel:{token}")
-    builder.adjust(2)
-    return builder.as_markup()
+    return b
 
 
 async def send_top_page(message: types.Message, page: int, owner_id: int, edit: bool = False):
@@ -544,31 +738,33 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
         )
 
     if not top:
-        return await message.answer("💠 Список лидеров пока пуст.")
+        b = RichText().add("💠 Список лидеров пока пуст.")
+        return await send_rich(message, b, edit=False)
 
-    res = [f"💠 <b>ТОП ЛИДЕРОВ</b> <i>({page + 1}/{total_pages})</i>\n"]
+    b = RichText()
+    b.add("💠 ").bold("ТОП ЛИДЕРОВ").add(f" ({page + 1}/{total_pages})\n\n")
+
     for i, row in enumerate(top, 1 + offset):
-        uid = row["user_id"]
-        name = row["name"]
-        pts = row["points"]
+        uid = int(row["user_id"])
+        name = str(row["name"])
+        pts = int(row["points"])
         username = row["username"]
+
+        b.add(f"{i}. ")
+
         if uid == MENTION_IN_TOP_USER_ID:
-            user_link = f'<a href="tg://user?id={uid}">{name}</a>'
+            b.link(name, f"tg://user?id={uid}")
         else:
             if username:
-                user_link = hlink(name, f"https://t.me/{username}")
+                b.link(name, f"https://t.me/{username}")
             else:
-                user_link = name
-        res.append(f"{i}. {user_link} | {hbold(pts)}")
+                b.add(name)
 
+        b.add(" | ").bold(pts).add("\n")
 
-    text = "\n".join(res)
     kb = get_top_keyboard(page, total_pages, owner_id)
+    await send_rich(message, b, reply_markup=kb, edit=edit)
 
-    if edit:
-        await message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
-    else:
-        await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
 @dp.message(Command("start", "bhelp", "бпомощь", "менюб", "menub"))
@@ -579,18 +775,78 @@ async def cmd_menu(message: types.Message):
         message.from_user.first_name,
         message.from_user.username
     )
-    await message.answer(
-        "<b>💠 Меню бота баллов</b>\nВыбери раздел кнопками ниже.",
-        reply_markup=main_menu_kb(message.from_user.id),
-        disable_web_page_preview=True
-    )
+    b = RichText()
+    b.add("💠 ").bold("Меню бота баллов").add("\n")
+    b.add("Выбери раздел кнопками ниже.")
+    await send_rich(message, b, reply_markup=main_menu_kb(message.from_user.id))
 
+
+@dp.message(F.text.startswith("+эмодзи"))
+async def premium_emoji_cmd(message: types.Message):
+    if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
+        return await message.reply("❌ Недостаточно прав. Нужно: админ 2 уровня.")
+
+    parts = (message.text or "").split()
+
+    if len(parts) == 1:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT emoji_text, custom_emoji_id, enabled FROM chat_emojis WHERE chat_id = $1 ORDER BY emoji_text ASC",
+                message.chat.id
+            )
+
+        b = RichText()
+        b.add("🧩 ").bold("Premium эмодзи — настройки").add("\n\n")
+        b.bold("Команды:").add("\n")
+        b.add("• +эмодзи сет <эмодзи> <custom_emoji_id>\n")
+        b.add("• +эмодзи вкл <эмодзи>\n")
+        b.add("• +эмодзи выкл <эмодзи>\n")
+        b.add("• +эмодзи дел <эмодзи>\n\n")
+        b.bold("Пример:").add("\n")
+        b.add("• +эмодзи сет 💠 5409123456789012345\n\n")
+        b.bold("Текущие настройки этого чата:").add("\n")
+
+        if not rows:
+            b.add("— пусто —")
+        else:
+            for r in rows:
+                emj = str(r["emoji_text"])
+                cid = r["custom_emoji_id"] or "—"
+                en = "✅" if r["enabled"] else "❌"
+                b.add(f"• {emj} | {en} | ").code(cid).add("\n")
+
+        return await send_rich(message, b)
+
+    if len(parts) >= 3:
+        action = parts[1].lower()
+        emoji_text = parts[2]
+
+        if action in ("сет", "set"):
+            if len(parts) < 4:
+                return await message.reply("Используй: +эмодзи сет <эмодзи> <custom_emoji_id>")
+            cid = parts[3].strip()
+            await set_chat_emoji(message.chat.id, emoji_text, cid, enabled=True)
+            return await message.reply(f"✅ Установлено: {emoji_text} → {cid}")
+
+        if action in ("вкл", "on"):
+            await toggle_chat_emoji(message.chat.id, emoji_text, True)
+            return await message.reply(f"✅ Включено: {emoji_text}")
+
+        if action in ("выкл", "off"):
+            await toggle_chat_emoji(message.chat.id, emoji_text, False)
+            return await message.reply(f"✅ Выключено: {emoji_text}")
+
+        if action in ("дел", "del", "удалить"):
+            await delete_chat_emoji(message.chat.id, emoji_text)
+            return await message.reply(f"✅ Удалено: {emoji_text}")
+
+    await message.reply("❌ Не понял команду. Напиши: +эмодзи")
 
 
 @dp.message(F.text.startswith("+рейтинг"))
 async def edit_rating_cmd(message: types.Message):
     if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
-        return
+        return await message.reply("❌ Недостаточно прав. Нужно: админ 2 уровня.")
 
     new_text = ""
     if message.reply_to_message and message.reply_to_message.text:
@@ -601,17 +857,17 @@ async def edit_rating_cmd(message: types.Message):
 
     if not new_text:
         current = await get_rating_text(message.chat.id)
-        return await message.reply(
-            "<b>💠 О рейтинге (текущая версия)</b>\n\n"
-            f"{current}\n\n"
-            "Чтобы изменить — отправь:\n"
-            "• <b>+рейтинг</b> <i>текст</i>\n"
-            "или ответь на сообщение с текстом командой <b>+рейтинг</b>",
-            disable_web_page_preview=True
-        )
+        b = RichText()
+        b.add("💠 ").bold("О рейтинге (текущая версия)").add("\n\n")
+        b.add(current).add("\n\n")
+        b.add("Чтобы изменить — отправь:\n")
+        b.add("• +рейтинг текст\n")
+        b.add("или ответь на сообщение с текстом командой +рейтинг")
+        return await send_rich(message, b)
 
     await set_rating_text(message.chat.id, new_text)
-    await message.reply("✅ Текст <b>«О рейтинге»</b> обновлён.", disable_web_page_preview=True)
+    b = RichText().add("✅ ").bold("Текст «О рейтинге» обновлён.")
+    await send_rich(message, b)
 
 
 @dp.callback_query(F.data.startswith("menu:"))
@@ -626,40 +882,28 @@ async def menu_handler(callback: types.CallbackQuery):
 
     lvl = await get_admin_level(callback.from_user.id, callback.message.chat.id)
     role = get_role_and_lvl(callback.from_user.id, lvl)
-    jp = await get_join_points(callback.message.chat.id)
 
     if action == "main":
-        await callback.message.edit_text(
-            "<b>💠 Меню бота баллов</b>\nВыбери раздел кнопками ниже.",
-            reply_markup=main_menu_kb(owner_id),
-            disable_web_page_preview=True
-        )
+        b = RichText()
+        b.add("💠 ").bold("Меню бота баллов").add("\n")
+        b.add("Выбери раздел кнопками ниже.")
+        await send_rich(callback.message, b, reply_markup=main_menu_kb(owner_id), edit=True)
         return await callback.answer()
 
     if action == "help":
-        text = build_help(role, lvl, jp)
-        await callback.message.edit_text(
-            text,
-            reply_markup=main_menu_kb(owner_id),
-            disable_web_page_preview=True
-        )
+        b = build_help(role)
+        await send_rich(callback.message, b, reply_markup=main_menu_kb(owner_id), edit=True)
         return await callback.answer()
 
     if action == "rating":
-        await callback.message.edit_text(
-            await get_rating_text(callback.message.chat.id),
-            reply_markup=main_menu_kb(owner_id),
-            disable_web_page_preview=True
-        )
+        txt = await get_rating_text(callback.message.chat.id)
+        b = RichText().add(txt)
+        await send_rich(callback.message, b, reply_markup=main_menu_kb(owner_id), edit=True)
         return await callback.answer()
 
     if action == "stats":
-        text = await get_my_stats_text(callback.from_user.id, callback.message.chat.id)
-        await callback.message.edit_text(
-            text,
-            reply_markup=main_menu_kb(owner_id),
-            disable_web_page_preview=True
-        )
+        b = await build_my_stats(callback.from_user.id, callback.message.chat.id)
+        await send_rich(callback.message, b, reply_markup=main_menu_kb(owner_id), edit=True)
         return await callback.answer()
 
     if action == "top":
@@ -678,14 +922,15 @@ async def set_join_points_cmd(message: types.Message):
     args = message.text.split()
     if len(args) < 2:
         jp = await get_join_points(message.chat.id)
-        return await message.reply(
-            f"Текущие стартовые баллы | <b>{jp}</b>\nУстановить | <b>/стартбаллы</b> 50"
-        )
+        b = RichText()
+        b.add("Текущие стартовые баллы | ").bold(jp).add("\n")
+        b.add("Установить | /стартбаллы 50")
+        return await send_rich(message, b)
 
     try:
         jp = int(args[1])
     except ValueError:
-        return await message.reply("Введите число. Используй | <b>/стартбаллы</b> 50")
+        return await message.reply("Введите число. Используй: /стартбаллы 50")
 
     jp = max(BALANCE_MIN, min(BALANCE_MAX, jp))
 
@@ -697,7 +942,8 @@ async def set_join_points_cmd(message: types.Message):
             DO UPDATE SET join_points = $2
         """, message.chat.id, jp)
 
-    await message.reply(f"✅ Стартовые баллы установлены на <b>{jp}</b>.")
+    b = RichText().add("✅ Стартовые баллы установлены на ").bold(jp).add(".")
+    await send_rich(message, b)
 
 
 @dp.message(Command("моиб", "myb"))
@@ -714,14 +960,13 @@ async def my_points(message: types.Message):
     status = get_point_role(int(points))
     mute_delta, warn_delta = calc_punishment_adjust(int(points))
 
-    await message.reply(
-        f"💠 {message.from_user.first_name}\n"
-        f"Баланс | <b>{points}</b>\n"
-        f"Статус | <b>{status}</b>\n\n"
-        f"🔇 Мут | <b>{fmt_minutes(mute_delta)}</b>\n"
-        f"⚠️ Варн | <b>{fmt_days(warn_delta)}</b>",
-        disable_web_page_preview=True
-    )
+    b = RichText()
+    b.add("💠 ").add(message.from_user.first_name).add("\n")
+    b.add("Баланс | ").bold(points).add("\n")
+    b.add("Статус | ").bold(status).add("\n\n")
+    b.add("🔇 Мут | ").bold(fmt_minutes(mute_delta)).add("\n")
+    b.add("⚠️ Варн | ").bold(fmt_days(warn_delta))
+    await send_rich(message, b)
 
 
 @dp.message(Command("инфо", "stats"))
@@ -748,36 +993,31 @@ async def check_stats(message: types.Message):
     if points is None:
         points = await get_join_points(message.chat.id)
 
-    user_link = silent_link(tname, tid)
     status = get_point_role(int(points))
     mute_delta, warn_delta = calc_punishment_adjust(int(points))
 
-    await message.answer(
-        f"<b>📊 Информация</b>\n"
-        f"👤 Пользователь | {user_link}\n"
-        f"💠 Баланс | <b>{points}</b>\n"
-        f"😎 Статус | <b>{status}</b>\n\n"
-        f"<b>⏱ Коррекция наказания по баллам</b>\n"
-        f"🔇 Мут | <b>{fmt_minutes(mute_delta)}</b>\n"
-        f"⚠️ Варн | <b>{fmt_days(warn_delta)}</b>",
-        disable_web_page_preview=True
-    )
+    b = RichText()
+    b.add("📊 ").bold("Информация").add("\n")
+    b.add("👤 Пользователь | ").link(tname, f"tg://user?id={tid}").add("\n")
+    b.add("💠 Баланс | ").bold(points).add("\n")
+    b.add("😎 Статус | ").bold(status).add("\n\n")
+    b.bold("⏱ Коррекция наказания по баллам").add("\n")
+    b.add("🔇 Мут | ").bold(fmt_minutes(mute_delta)).add("\n")
+    b.add("⚠️ Варн | ").bold(fmt_days(warn_delta))
+    await send_rich(message, b)
 
 
 @dp.message(Command("топб", "topb"))
 async def show_top_command(message: types.Message):
     args = message.text.split()
     page = 0
-
     if len(args) >= 2:
         try:
             page = int(args[1]) - 1
         except ValueError:
             page = 0
-
     if page < 0:
         page = 0
-
     await send_top_page(message, page, owner_id=message.from_user.id)
 
 
@@ -805,12 +1045,12 @@ async def transfer_points(message: types.Message):
 
     args = message.text.split()
     if len(args) < 2:
-        return await message.reply("Используй | <b>/передать</b> 30 @username (или ответом: <b>/передать</b> 30)")
+        return await message.reply("Используй: /передать 30 @username (или ответом: /передать 30)")
 
     try:
         amount = int(args[1])
     except ValueError:
-        return await message.reply("Ошибка! Используй | <b>/передать</b> 30 @username")
+        return await message.reply("Ошибка! Используй: /передать 30 @username")
 
     if amount <= 0:
         return await message.reply("Введите положительное число.")
@@ -831,7 +1071,7 @@ async def transfer_points(message: types.Message):
 
     received_raw = amount // TRANSFER_RATE
     if received_raw <= 0:
-        return await message.reply(f"Минимальный перевод | <b>{TRANSFER_RATE}</b> (получит <b>1</b> балл).")
+        return await message.reply(f"Минимальный перевод | {TRANSFER_RATE} (получит 1 балл).")
 
     async with pool.acquire() as conn:
         sender_pts = await conn.fetchval(
@@ -851,10 +1091,10 @@ async def transfer_points(message: types.Message):
     if target_pts + received_raw > BALANCE_MAX:
         can = max(0, BALANCE_MAX - target_pts)
         return await message.reply(
-            f"❌ Перевод невозможен | будет больше <b>{BALANCE_MAX}</b>.\n"
-            f"Сейчас | <b>{target_pts}</b>\n"
-            f"Максимум принять | <b>{can}</b>\n"
-            f"Ты хотел (получит) | <b>{received_raw}</b>"
+            f"❌ Перевод невозможен: будет больше {BALANCE_MAX}.\n"
+            f"Сейчас: {target_pts}\n"
+            f"Максимум принять: {can}\n"
+            f"Ты хотел (получит): {received_raw}"
         )
 
     actual_received = received_raw
@@ -862,17 +1102,14 @@ async def transfer_points(message: types.Message):
 
     if sender_pts - actual_spent < MIN_POINTS_TO_TRANSFER:
         return await message.reply(
-            f"❌ После перевода должно остаться минимум <b>{MIN_POINTS_TO_TRANSFER}</b>.\n"
-            f"Сейчас | <b>{sender_pts}</b>\n"
-            f"Спишется | <b>{actual_spent}</b>\n"
-            f"Останется | <b>{sender_pts - actual_spent}</b>"
+            f"❌ После перевода должно остаться минимум {MIN_POINTS_TO_TRANSFER}.\n"
+            f"Сейчас: {sender_pts}\n"
+            f"Спишется: {actual_spent}\n"
+            f"Останется: {sender_pts - actual_spent}"
         )
 
     if sender_pts < actual_spent:
         return await message.reply("❌ Недостаточно баллов для перевода.")
-
-    sender_l = silent_link(message.from_user.first_name, message.from_user.id)
-    target_l = silent_link(tname, tid)
 
     token = secrets.token_urlsafe(8).replace("-", "").replace("_", "")
     pending_transfers[token] = {
@@ -886,16 +1123,15 @@ async def transfer_points(message: types.Message):
         "received": actual_received
     }
 
-    text = (
-        f"💠 <b>Подтверждение перевода</b>\n\n"
-        f"👤 Отправитель | {sender_l}\n"
-        f"🎯 Получатель | {target_l}\n\n"
-        f"📉 Спишется | <b>{actual_spent}</b>\n"
-        f"📈 Получит | <b>{actual_received}</b>\n"
-        f"🔁 Курс | <b>{TRANSFER_RATE}:1</b>\n"
-    )
+    b = RichText()
+    b.add("💠 ").bold("Подтверждение перевода").add("\n\n")
+    b.add("👤 Отправитель | ").link(message.from_user.first_name, f"tg://user?id={message.from_user.id}").add("\n")
+    b.add("🎯 Получатель | ").link(tname, f"tg://user?id={tid}").add("\n\n")
+    b.add("📉 Спишется | ").bold(actual_spent).add("\n")
+    b.add("📈 Получит | ").bold(actual_received).add("\n")
+    b.add("🔁 Курс | ").bold(f"{TRANSFER_RATE}:1").add("\n")
 
-    await message.answer(text, reply_markup=transfer_confirm_kb(token), disable_web_page_preview=True)
+    await send_rich(message, b, reply_markup=transfer_confirm_kb(token))
 
 
 @dp.callback_query(F.data.startswith("tconf:"))
@@ -934,19 +1170,17 @@ async def transfer_confirm(callback: types.CallbackQuery):
 
         if target_pts + actual_received > BALANCE_MAX:
             pending_transfers.pop(token, None)
-            await callback.message.edit_text(f"❌ Перевод невозможен | больше {BALANCE_MAX}.")
+            await callback.message.edit_text(f"❌ Перевод невозможен: больше {BALANCE_MAX}.")
             return await callback.answer()
 
         if sender_pts < actual_spent:
             pending_transfers.pop(token, None)
-            await callback.message.edit_text("❌ Перевод невозможен | недостаточно баллов у отправителя.")
+            await callback.message.edit_text("❌ Перевод невозможен: недостаточно баллов у отправителя.")
             return await callback.answer()
 
         if sender_pts - actual_spent < MIN_POINTS_TO_TRANSFER:
             pending_transfers.pop(token, None)
-            await callback.message.edit_text(
-                f"❌ Перевод невозможен | после перевода минимум {MIN_POINTS_TO_TRANSFER}."
-            )
+            await callback.message.edit_text(f"❌ Перевод невозможен: после перевода минимум {MIN_POINTS_TO_TRANSFER}.")
             return await callback.answer()
 
         new_sender = sender_pts - actual_spent
@@ -963,15 +1197,14 @@ async def transfer_confirm(callback: types.CallbackQuery):
 
     pending_transfers.pop(token, None)
 
-    sender_l = silent_link(req["sender_name"], req["sender_id"])
-    target_l = silent_link(req["target_name"], req["target_id"])
+    b = RichText()
+    b.add("✅ ").bold("Перевод выполнен!").add("\n")
+    b.add("💠 ").link(req["sender_name"], f"tg://user?id={req['sender_id']}").add(" передал ")
+    b.link(req["target_name"], f"tg://user?id={req['target_id']}").add(" ")
+    b.bold(actual_received).add(" балл(ов)\n")
+    b.add("📉 Списано | ").bold(actual_spent).add(f" (курс {TRANSFER_RATE}:1)")
 
-    await callback.message.edit_text(
-        f"✅ Перевод выполнен!\n"
-        f"💠 {sender_l} передал {target_l} <b>{actual_received}</b> балл(ов)\n"
-        f"📉 Списано | <b>{actual_spent}</b> (курс {TRANSFER_RATE}:1)",
-        disable_web_page_preview=True
-    )
+    await send_rich(callback.message, b, edit=True)
     await callback.answer()
 
 
@@ -998,14 +1231,12 @@ async def change_points(message: types.Message):
 
     args = message.text.split()
     if len(args) < 2:
-        return await message.reply(
-            "Используй: <code>/балл +10 @username причина</code> или ответом: <code>/балл +10 причина</code>"
-        )
+        return await message.reply("Используй: /балл +10 @username причина (или ответом: /балл +10 причина)")
 
     try:
         amount = int(args[1])
     except ValueError:
-        return await message.reply("Ошибка! Пример: <code>/балл -2 @user флуд</code>")
+        return await message.reply("Ошибка! Пример: /балл -2 @user флуд")
 
     tid, tname, tuname, err = await resolve_target(message, args)
     if err == "no_target":
@@ -1019,8 +1250,6 @@ async def change_points(message: types.Message):
         return await message.reply("❌ Пользователь не найден в базе этого чата.\nПусть он напишет сообщение.")
 
     reason = extract_reason_from_args(args)
-    reason_line_chat = f"\n📝 Причина: <i>{reason}</i>" if reason else ""
-    reason_line_log = f"\n📝 Причина: <b>{reason}</b>" if reason else "\n📝 Причина: <i>не указана</i>"
 
     async with pool.acquire() as conn:
         current_pts = await conn.fetchval(
@@ -1032,14 +1261,14 @@ async def change_points(message: types.Message):
 
         if amount > 0 and current_pts + amount > BALANCE_MAX:
             return await message.reply(
-                f"❌ Нельзя начислить столько баллов: будет превышен лимит <b>{BALANCE_MAX}</b>.\n"
-                f"Сейчас: <b>{current_pts}</b>, пытаешься начислить: <b>{amount}</b>, получилось бы: <b>{current_pts + amount}</b>."
+                f"❌ Нельзя начислить столько: будет превышен лимит {BALANCE_MAX}.\n"
+                f"Сейчас: {current_pts}, начисляешь: {amount}, было бы: {current_pts + amount}."
             )
 
         if amount < 0 and current_pts + amount < BALANCE_MIN:
             return await message.reply(
-                f"❌ Нельзя снять столько баллов: баланс не может быть меньше <b>{BALANCE_MIN}</b>.\n"
-                f"Сейчас: <b>{current_pts}</b>, пытаешься снять: <b>{abs(amount)}</b>, получилось бы: <b>{current_pts + amount}</b>."
+                f"❌ Нельзя снять столько: баланс не может быть меньше {BALANCE_MIN}.\n"
+                f"Сейчас: {current_pts}, снимаешь: {abs(amount)}, было бы: {current_pts + amount}."
             )
 
         new_pts = current_pts + amount
@@ -1048,32 +1277,33 @@ async def change_points(message: types.Message):
             new_pts, tid, message.chat.id
         )
 
-    admin_l = silent_link(message.from_user.first_name, message.from_user.id)
-    target_l = silent_link(tname, tid)
-
+    b = RichText()
     if amount >= 0:
-        await message.answer(
-            f"⬆️ Администратор {admin_l} начислил {target_l} <b>{abs(amount)}</b> баллов.{reason_line_chat}",
-            disable_web_page_preview=True
-        )
+        b.add("⬆️ Администратор ").link(message.from_user.first_name, f"tg://user?id={message.from_user.id}")
+        b.add(" начислил ").link(tname, f"tg://user?id={tid}").add(" ")
+        b.bold(abs(amount)).add(" баллов.")
     else:
-        await message.answer(
-            f"⬇️ Администратор {admin_l} снял у {target_l} <b>{abs(amount)}</b> баллов.{reason_line_chat}",
-            disable_web_page_preview=True
-        )
+        b.add("⬇️ Администратор ").link(message.from_user.first_name, f"tg://user?id={message.from_user.id}")
+        b.add(" снял у ").link(tname, f"tg://user?id={tid}").add(" ")
+        b.bold(abs(amount)).add(" баллов.")
+
+    if reason:
+        b.add("\n📝 Причина: ").italic(reason)
+
+    await send_rich(message, b)
 
     chat_title = message.chat.title or str(message.chat.id)
     action = "начислил" if amount >= 0 else "снял"
     sign = "+" if amount >= 0 else "-"
 
     await log_to_owner(
-        "🧾 <b>Лог баллов</b>\n"
-        f"🏷 Чат: <b>{chat_title}</b> (<code>{message.chat.id}</code>)\n"
-        f"👮 Админ: {admin_l} (<code>{message.from_user.id}</code>)\n"
-        f"👤 Участник: {target_l} (<code>{tid}</code>)\n"
-        f"📌 Действие: <b>{action}</b> {sign}<b>{abs(amount)}</b>\n"
-        f"💠 Новый баланс: <b>{new_pts}</b>"
-        f"{reason_line_log}"
+        "🧾 Лог баллов\n"
+        f"🏷 Чат: {chat_title} ({message.chat.id})\n"
+        f"👮 Админ: {message.from_user.first_name} ({message.from_user.id})\n"
+        f"👤 Участник: {tname} ({tid})\n"
+        f"📌 Действие: {action} {sign}{abs(amount)}\n"
+        f"💠 Новый баланс: {new_pts}\n"
+        f"📝 Причина: {reason if reason else 'не указана'}"
     )
 
 
@@ -1084,26 +1314,18 @@ async def change_points_mass(message: types.Message):
 
     args = message.text.split()
     if len(args) < 4:
-        return await message.reply(
-            "Используй: <code>/баллм -5 @user1 @user2 причина</code>\n"
-            "Можно указать много @username."
-        )
+        return await message.reply("Используй: /баллм -5 @user1 @user2 причина (можно много @username)")
 
     try:
         amount = int(args[1])
     except ValueError:
-        return await message.reply("Ошибка! Пример: <code>/баллм -5 @user1 @user2 флуд</code>")
+        return await message.reply("Ошибка! Пример: /баллм -5 @user1 @user2 флуд")
 
     mentions = [a for a in args[2:] if a.startswith("@")]
     if not mentions:
         return await message.reply("⚠️ Укажи хотя бы один @username.")
 
     reason = extract_mass_reason(args)
-    reason_line_chat = f"\n📝 Причина: <i>{reason}</i>" if reason else ""
-    reason_line_log = f"\n📝 Причина: <b>{reason}</b>" if reason else "\n📝 Причина: <i>не указана</i>"
-
-    admin_l = silent_link(message.from_user.first_name, message.from_user.id)
-    chat_title = message.chat.title or str(message.chat.id)
 
     ok_lines = []
     fail_lines = []
@@ -1127,25 +1349,20 @@ async def change_points_mass(message: types.Message):
                 current_pts = await get_join_points(message.chat.id)
 
             if amount > 0 and current_pts + amount > BALANCE_MAX:
-                fail_lines.append(
-                    f"• {tname}: нельзя +{amount} (сейчас {current_pts}, было бы {current_pts + amount} > {BALANCE_MAX})"
-                )
+                fail_lines.append(f"• {tname}: нельзя +{amount} (сейчас {current_pts}, было бы > {BALANCE_MAX})")
                 continue
 
             if amount < 0 and current_pts + amount < BALANCE_MIN:
-                fail_lines.append(
-                    f"• {tname}: нельзя {amount} (сейчас {current_pts}, было бы {current_pts + amount} < {BALANCE_MIN})"
-                )
+                fail_lines.append(f"• {tname}: нельзя {amount} (сейчас {current_pts}, было бы < {BALANCE_MIN})")
                 continue
 
             new_pts = current_pts + amount
-
             await conn.execute(
                 "UPDATE users SET points = $1 WHERE user_id = $2 AND chat_id = $3",
                 new_pts, tid, message.chat.id
             )
 
-            ok_lines.append(f"• {silent_link(tname, tid)}: {current_pts} → <b>{new_pts}</b>")
+            ok_lines.append((tname, tid, current_pts, new_pts))
 
     if not ok_lines and fail_lines:
         return await message.answer("❌ Никому не удалось изменить баллы.\n\n" + "\n".join(fail_lines))
@@ -1153,26 +1370,23 @@ async def change_points_mass(message: types.Message):
     sign = "+" if amount >= 0 else "-"
     action_word = "начислил" if amount >= 0 else "снял"
 
-    text = (
-        f"<b>🧾 Массовое изменение баллов</b>\n"
-        f"👮 Админ: {admin_l}\n"
-        f"📌 Действие: <b>{action_word}</b> {sign}<b>{abs(amount)}</b>\n\n"
-        f"<b>✅ Успешно:</b>\n" + "\n".join(ok_lines) +
-        (f"\n\n<b>⚠️ Ошибки:</b>\n" + "\n".join(fail_lines) if fail_lines else "") +
-        reason_line_chat
-    )
+    b = RichText()
+    b.add("🧾 ").bold("Массовое изменение баллов").add("\n")
+    b.add("👮 Админ: ").link(message.from_user.first_name, f"tg://user?id={message.from_user.id}").add("\n")
+    b.add("📌 Действие: ").bold(f"{action_word} {sign}{abs(amount)}").add("\n\n")
+    b.bold("✅ Успешно:").add("\n")
+    for tname, tid, oldp, newp in ok_lines:
+        b.add("• ").link(tname, f"tg://user?id={tid}").add(f": {oldp} → ").bold(newp).add("\n")
 
-    await message.answer(text, disable_web_page_preview=True)
+    if fail_lines:
+        b.add("\n").bold("⚠️ Ошибки:").add("\n")
+        for line in fail_lines:
+            b.add(line).add("\n")
 
-    await log_to_owner(
-        "🧾 <b>Лог массовых баллов</b>\n"
-        f"🏷 Чат: <b>{chat_title}</b> (<code>{message.chat.id}</code>)\n"
-        f"👮 Админ: {admin_l} (<code>{message.from_user.id}</code>)\n"
-        f"📌 Действие: <b>{action_word}</b> {sign}<b>{abs(amount)}</b>\n"
-        f"✅ Успешно: <b>{len(ok_lines)}</b>\n"
-        f"⚠️ Ошибки: <b>{len(fail_lines)}</b>"
-        f"{reason_line_log}"
-    )
+    if reason:
+        b.add("\n📝 Причина: ").italic(reason)
+
+    await send_rich(message, b)
 
 
 @dp.message(Command("повысить", "promote"))
@@ -1191,7 +1405,7 @@ async def promote_owner(message: types.Message):
 
     tid, name, tuname, err = await resolve_target(message, args)
     if err == "no_target":
-        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/повысить @user 2</code>")
+        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: /повысить @user 2")
     if err == "not_found":
         return await message.reply("❌ Пользователь не найден. Пусть он напишет сообщение в любой чат с ботом.")
     if err == "not_in_chat":
@@ -1204,7 +1418,9 @@ async def promote_owner(message: types.Message):
         return await message.reply("❌ Пользователь не найден в базе этого чата.\nПусть он напишет сообщение.")
 
     await set_admin_level(message.chat.id, tid, level, mode="force")
-    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ {level}</b> уровня.", disable_web_page_preview=True)
+
+    b = RichText().add("✅ ").link(name, f"tg://user?id={tid}").add(" теперь ").bold(f"админ {level}").add(" уровня.")
+    await send_rich(message, b)
 
 
 @dp.message(Command("админ", "admin"))
@@ -1218,7 +1434,7 @@ async def make_admin_lvl1(message: types.Message):
     args = message.text.split()
     tid, name, tuname, err = await resolve_target(message, args)
     if err == "no_target":
-        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/админ @user</code>")
+        return await message.reply("⚠️ Укажи @username или ответь.\nПример: /админ @user")
     if err == "not_found":
         return await message.reply("❌ Пользователь не найден. Пусть он напишет сообщение в любой чат с ботом.")
     if err == "not_in_chat":
@@ -1232,10 +1448,12 @@ async def make_admin_lvl1(message: types.Message):
 
     current = await get_admin_level(tid, message.chat.id)
     if current >= 2:
-        return await message.answer(f"ℹ️ {silent_link(name, tid)} уже <b>админ 2</b> уровня.", disable_web_page_preview=True)
+        b = RichText().add("ℹ️ ").link(name, f"tg://user?id={tid}").add(" уже ").bold("админ 2").add(" уровня.")
+        return await send_rich(message, b)
 
     await set_admin_level(message.chat.id, tid, 1, mode="max")
-    await message.answer(f"✅ {silent_link(name, tid)} теперь <b>админ 1</b> уровня.", disable_web_page_preview=True)
+    b = RichText().add("✅ ").link(name, f"tg://user?id={tid}").add(" теперь ").bold("админ 1").add(" уровня.")
+    await send_rich(message, b)
 
 
 @dp.message(Command("разжаловать", "unadmin"))
@@ -1249,7 +1467,7 @@ async def remove_admin(message: types.Message):
     args = message.text.split()
     tid, name, tuname, err = await resolve_target(message, args)
     if err == "no_target":
-        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/разжаловать @user</code>")
+        return await message.reply("⚠️ Укажи @username или ответь.\nПример: /разжаловать @user")
     if err == "not_found":
         return await message.reply("❌ Пользователь не найден. Пусть он напишет сообщение в любой чат с ботом.")
     if err == "not_in_chat":
@@ -1266,10 +1484,11 @@ async def remove_admin(message: types.Message):
         return await message.answer("ℹ️ Этот пользователь не админ.", disable_web_page_preview=True)
 
     if not issuer_is_owner and current >= 2:
-        return await message.reply("❌ Ты можешь снимать только <b>админа 1</b> уровня.")
+        return await message.reply("❌ Ты можешь снимать только админа 1 уровня.")
 
     await remove_admin_level(message.chat.id, tid)
-    await message.answer(f"❌ {silent_link(name, tid)} больше <b>не админ</b>.", disable_web_page_preview=True)
+    b = RichText().add("❌ ").link(name, f"tg://user?id={tid}").add(" больше ").bold("не админ").add(".")
+    await send_rich(message, b)
 
 
 @dp.message(Command("бадмины", "badmins"))
@@ -1293,22 +1512,23 @@ async def list_admins(message: types.Message):
         """, message.chat.id)
 
     if not rows:
-        return await message.answer("Список админов пуст.")
+        return await message.answer("Список админов пуст.", disable_web_page_preview=True)
 
-    lines = ["<b>🛡 Список админов</b>\n"]
+    b = RichText()
+    b.add("🛡 ").bold("Список админов").add("\n\n")
     for i, r in enumerate(rows, 1):
         name = r["name"] or "Без имени"
         username = r["username"]
         level = int(r["level"]) if r["level"] is not None else 1
 
+        b.add(f"{i}. ")
         if username:
-            admin_display = hlink(name, f"https://t.me/{username}")
+            b.link(name, f"https://t.me/{username}")
         else:
-            admin_display = name
+            b.link(name, f"tg://user?id={int(r['user_id'])}")
+        b.add(" — ").bold(f"{level}").add(" уровень\n")
 
-        lines.append(f"{i}. {admin_display} — <b>{level}</b> уровень")
-
-    await message.answer("\n".join(lines), disable_web_page_preview=True)
+    await send_rich(message, b)
 
 
 @dp.message()
