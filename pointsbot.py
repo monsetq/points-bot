@@ -238,7 +238,11 @@ async def set_chat_emoji(chat_id: int, emoji_text: str, custom_emoji_id: str, en
             DO UPDATE SET custom_emoji_id = EXCLUDED.custom_emoji_id,
                           enabled = EXCLUDED.enabled
         """, chat_id, emoji_text, custom_emoji_id, bool(enabled))
-    _EMOJI_CACHE.pop(chat_id, None)
+
+    if chat_id == 0:
+        _EMOJI_CACHE.clear()
+    else:
+        _EMOJI_CACHE.pop(chat_id, None)
 
 
 async def toggle_chat_emoji(chat_id: int, emoji_text: str, enabled: bool):
@@ -252,7 +256,11 @@ async def toggle_chat_emoji(chat_id: int, emoji_text: str, enabled: bool):
             ON CONFLICT (chat_id, emoji_text)
             DO UPDATE SET enabled = EXCLUDED.enabled
         """, chat_id, emoji_text, bool(enabled))
-    _EMOJI_CACHE.pop(chat_id, None)
+
+    if chat_id == 0:
+        _EMOJI_CACHE.clear()
+    else:
+        _EMOJI_CACHE.pop(chat_id, None)
 
 
 async def delete_chat_emoji(chat_id: int, emoji_text: str):
@@ -261,7 +269,11 @@ async def delete_chat_emoji(chat_id: int, emoji_text: str):
         return
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM chat_emojis WHERE chat_id = $1 AND emoji_text = $2", chat_id, emoji_text)
-    _EMOJI_CACHE.pop(chat_id, None)
+
+    if chat_id == 0:
+        _EMOJI_CACHE.clear()
+    else:
+        _EMOJI_CACHE.pop(chat_id, None)
 
 
 POINT_ROLES = [
@@ -789,29 +801,50 @@ async def cmd_menu(message: types.Message):
 
 @dp.message(F.text.startswith("+эмодзи"))
 async def premium_emoji_cmd(message: types.Message):
-    if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
-        return await message.reply("❌ Недостаточно прав. Нужно: админ 2 уровня.")
-
     parts = (message.text or "").split()
 
-    if len(parts) == 1:
+    is_global = len(parts) >= 2 and parts[1].lower() in ("глоб", "global", "g")
+
+    if is_global:
+        if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
+            return
+        target_chat_id = 0
+        arg_shift = 1
+        scope_name = "🌍 Глобальные"
+
+    else:
+        if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
+            return
+        target_chat_id = message.chat.id
+        arg_shift = 0
+        scope_name = "🏠 Эмодзи этого чата"
+
+
+    if len(parts) == 1 or (is_global and len(parts) == 2):
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT emoji_text, custom_emoji_id, enabled FROM chat_emojis WHERE chat_id = $1 ORDER BY emoji_text ASC",
-                message.chat.id
+                target_chat_id
             )
 
         b = RichText()
-        b.add("🧩 ").bold("Premium эмодзи — настройки").add("\n\n")
-        b.bold("Команды:").add("\n")
-        b.add("• +эмодзи сет <эмодзи> <custom_emoji_id>\n")
-        b.add("• +эмодзи вкл <эмодзи>\n")
-        b.add("• +эмодзи выкл <эмодзи>\n")
-        b.add("• +эмодзи дел <эмодзи>\n\n")
-        b.bold("Пример:").add("\n")
-        b.add("• +эмодзи сет 💠 5409123456789012345\n\n")
-        b.bold("Текущие настройки этого чата:").add("\n")
+        b.add("🧩 ").bold(f"{scope_name} — настройки").add("\n\n")
 
+        b.bold("Команды:").add("\n")
+        if is_global:
+            b.add("• +эмодзи глоб сет «эмодзи» «custom_emoji_id»\n")
+            b.add("• +эмодзи глоб вкл «эмодзи»\n")
+            b.add("• +эмодзи глоб выкл «эмодзи»\n")
+            b.add("• +эмодзи глоб дел «эмодзи»\n\n")
+            b.add("Пример: +эмодзи глоб сет 💠 5409123456789012345\n\n")
+        else:
+            b.add("• +эмодзи сет «эмодзи» «custom_emoji_id»\n")
+            b.add("• +эмодзи вкл «эмодзи»\n")
+            b.add("• +эмодзи выкл «эмодзи»\n")
+            b.add("• +эмодзи дел «эмодзи»\n\n")
+            b.add("Пример: +эмодзи сет 💠 5409123456789012345\n\n")
+
+        b.bold("Текущие значения:").add("\n")
         if not rows:
             b.add("— пусто —")
         else:
@@ -823,30 +856,39 @@ async def premium_emoji_cmd(message: types.Message):
 
         return await send_rich(message, b)
 
-    if len(parts) >= 3:
-        action = parts[1].lower()
-        emoji_text = parts[2]
+    if len(parts) < 3 + arg_shift:
+        return await message.reply("❌ Не понял. Напиши просто: +эмодзи (или +эмодзи глоб)")
 
-        if action in ("сет", "set"):
-            if len(parts) < 4:
-                return await message.reply("Используй: +эмодзи сет <эмодзи> <custom_emoji_id>")
-            cid = parts[3].strip()
-            await set_chat_emoji(message.chat.id, emoji_text, cid, enabled=True)
-            return await message.reply(f"✅ Установлено: {emoji_text} → {cid}")
+    action = parts[1 + arg_shift].lower()
+    emoji_text = parts[2 + arg_shift]
 
-        if action in ("вкл", "on"):
-            await toggle_chat_emoji(message.chat.id, emoji_text, True)
-            return await message.reply(f"✅ Включено: {emoji_text}")
+    if action in ("сет", "set"):
+        if len(parts) < 4 + arg_shift:
+            if is_global:
+                return await message.reply("Используй: +эмодзи глоб сет «эмодзи» «custom_emoji_id»")
+            return await message.reply("Используй: +эмодзи сет «эмодзи» «custom_emoji_id»")
 
-        if action in ("выкл", "off"):
-            await toggle_chat_emoji(message.chat.id, emoji_text, False)
-            return await message.reply(f"✅ Выключено: {emoji_text}")
+        cid = parts[3 + arg_shift].strip()
+        await set_chat_emoji(target_chat_id, emoji_text, cid, enabled=True)
+        prefix = "🌍 Глобально" if is_global else "🏠 В чате"
+        return await message.reply(f"✅ {prefix}: {emoji_text} → {cid}")
 
-        if action in ("дел", "del", "удалить"):
-            await delete_chat_emoji(message.chat.id, emoji_text)
-            return await message.reply(f"✅ Удалено: {emoji_text}")
+    if action in ("вкл", "on"):
+        await toggle_chat_emoji(target_chat_id, emoji_text, True)
+        prefix = "🌍 Глобально" if is_global else "🏠 В чате"
+        return await message.reply(f"✅ {prefix} включено: {emoji_text}")
 
-    await message.reply("❌ Не понял команду. Напиши: +эмодзи")
+    if action in ("выкл", "off"):
+        await toggle_chat_emoji(target_chat_id, emoji_text, False)
+        prefix = "🌍 Глобально" if is_global else "🏠 В чате"
+        return await message.reply(f"✅ {prefix} выключено: {emoji_text}")
+
+    if action in ("дел", "del", "удалить", "remove"):
+        await delete_chat_emoji(target_chat_id, emoji_text)
+        prefix = "🌍 Глобально" if is_global else "🏠 В чате"
+        return await message.reply(f"✅ {prefix} удалено: {emoji_text}")
+
+    return await message.reply("❌ Не понял команду. Напиши: +эмодзи (или +эмодзи глоб)")
 
 
 @dp.message(F.text.startswith("+рейтинг"))
@@ -1535,6 +1577,17 @@ async def list_admins(message: types.Message):
         b.add(" — ").bold(f"{level}").add(" уровень\n")
 
     await send_rich(message, b)
+
+
+@dp.message(F.entities)
+async def catch_custom_emoji_id(message: types.Message):
+    for ent in message.entities:
+        if ent.type == "custom_emoji":
+            await message.reply(
+                f"🆔 custom_emoji_id:\n<code>{ent.custom_emoji_id}</code>",
+                parse_mode="HTML"
+            )
+            return
 
 
 @dp.message()
