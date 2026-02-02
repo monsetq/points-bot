@@ -6,10 +6,11 @@ import time
 import secrets
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
-
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "1875573844"))
@@ -28,7 +29,10 @@ logging.basicConfig(level=logging.INFO)
 BALANCE_MIN = 0
 BALANCE_MAX = 100
 
-bot = Bot(token=TOKEN, parse_mode="HTML")
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=None)
+)
 dp = Dispatcher()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -96,18 +100,20 @@ async def send_rich(message_or_cbmsg, rich: RichText, reply_markup=None, edit: b
 
     if edit:
         await message_or_cbmsg.edit_text(
-            final_text,
-            entities=final_entities,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True
+    final_text,
+    entities=final_entities,
+    reply_markup=reply_markup,
+    disable_web_page_preview=True,
+    parse_mode=None
         )
     else:
         await message_or_cbmsg.answer(
-            final_text,
-            entities=final_entities,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True
-        )
+    final_text,
+    entities=final_entities,
+    reply_markup=reply_markup,
+    disable_web_page_preview=True,
+    parse_mode=None
+        ) 
 
 
 _EMOJI_CACHE: Dict[int, Tuple[float, Dict[str, Tuple[str, bool]]]] = {}
