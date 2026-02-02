@@ -12,7 +12,8 @@ from aiogram.utils.markdown import hbold, hlink
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "1875573844"))
-MENTION_IN_TOP_USER_ID = 1183110737
+
+MENTION_IN_TOP_USER_ID = 6599896838
 
 MIN_POINTS_TO_TRANSFER = 50
 TRANSFER_RATE = 3
