@@ -4,10 +4,12 @@ import os
 import asyncpg
 import time
 import secrets
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.utils.markdown import hbold, hlink
+from aiogram.client.default import DefaultBotProperties
 
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "1875573844"))
@@ -24,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 BALANCE_MIN = 0
 BALANCE_MAX = 100
 
-bot = Bot(token=TOKEN, parse_mode="HTML")
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -54,17 +56,6 @@ async def init_db():
         """)
 
         await conn.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id BIGINT PRIMARY KEY,
-            level INT NOT NULL DEFAULT 1
-        )
-        """)
-
-        await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS chat_id BIGINT")
-        await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS level INT NOT NULL DEFAULT 1")
-        await conn.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS user_id BIGINT")
-
-        await conn.execute("""
         CREATE TABLE IF NOT EXISTS admins_v2 (
             chat_id BIGINT NOT NULL,
             user_id BIGINT NOT NULL,
@@ -73,17 +64,34 @@ async def init_db():
         )
         """)
 
-        await conn.execute("""
-        INSERT INTO admins_v2 (chat_id, user_id, level)
-        SELECT COALESCE(chat_id, 0) AS chat_id, user_id, level
-        FROM admins
-        WHERE user_id IS NOT NULL
-        ON CONFLICT (chat_id, user_id)
-        DO UPDATE SET level = GREATEST(admins_v2.level, EXCLUDED.level)
-        """)
+        try:
+            await conn.execute("""
+            INSERT INTO admins_v2 (chat_id, user_id, level)
+            SELECT COALESCE(chat_id, 0) AS chat_id, user_id, level
+            FROM admins
+            WHERE user_id IS NOT NULL
+            ON CONFLICT (chat_id, user_id)
+            DO UPDATE SET level = GREATEST(admins_v2.level, EXCLUDED.level)
+            """)
+        except Exception:
+            try:
+                await conn.execute("""
+                INSERT INTO admins_v2 (chat_id, user_id, level)
+                SELECT 0 AS chat_id, user_id, level
+                FROM admins
+                WHERE user_id IS NOT NULL
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET level = GREATEST(admins_v2.level, EXCLUDED.level)
+                """)
+            except Exception:
+                pass
 
         try:
-            await conn.execute("DROP TABLE admins")
+            await conn.execute("DROP TABLE IF EXISTS admins")
+        except Exception:
+            pass
+
+        try:
             await conn.execute("ALTER TABLE admins_v2 RENAME TO admins")
         except Exception:
             pass
@@ -100,7 +108,6 @@ async def init_db():
         SET points = 50
         WHERE points = 0
         """)
-
 
 
 async def get_join_points(chat_id: int) -> int:
@@ -270,13 +277,110 @@ def extract_mass_reason(args: list) -> str:
     return " ".join(args[last_at + 1:]).strip()
 
 
+def get_role_and_lvl(user_id: int, lvl: int) -> str:
+    if user_id == OWNER_ID:
+        return "owner"
+    if lvl >= 2:
+        return "admin2"
+    if lvl >= 1:
+        return "admin1"
+    return "member"
+
+
+def main_menu_kb(owner_id: int):
+    b = InlineKeyboardBuilder()
+    b.button(text="📖 Команды", callback_data=f"menu:{owner_id}:help")
+    b.button(text="🏆 Топ", callback_data=f"menu:{owner_id}:top:0")
+    b.button(text="📊 Моя статистика", callback_data=f"menu:{owner_id}:stats")
+    b.adjust(1, 2)
+    return b.as_markup()
+
+
+async def get_my_stats_text(user_id: int, chat_id: int) -> str:
+    async with pool.acquire() as conn:
+        points = await conn.fetchval(
+            "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
+            user_id, chat_id
+        )
+        if points is None:
+            points = await get_join_points(chat_id)
+
+        total = await conn.fetchval("SELECT COUNT(*) FROM users WHERE chat_id = $1", chat_id)
+        higher = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE chat_id = $1 AND points > $2",
+            chat_id, points
+        )
+
+    place = (int(higher) + 1) if higher is not None else 1
+    total = int(total) if total is not None else 0
+
+    return (
+        "<b>📊 Моя статистика</b>\n"
+        f"💠 Баланс | <b>{points}</b>\n"
+        f"🏅 Место | <b>{place}</b> из <b>{total}</b>\n"
+    )
+
+
+def build_help(role: str, lvl: int, join_points: int) -> str:
+    header = (
+        "╭─ <b>💠 Меню бота баллов</b>\n"
+        f"├ 🎁 Старт | <b>{join_points}</b>\n"
+        f"├ 🔒 Лимит | <b>{BALANCE_MIN}</b>–<b>{BALANCE_MAX}</b>\n"
+        f"╰ 🔁 Курс | <b>{TRANSFER_RATE}:1</b>\n"
+    )
+
+    if role in ("admin1", "admin2", "owner"):
+        header += f"\n🌐 <b>Уровень</b> | {lvl}\n"
+    header += "\n"
+
+    common = (
+        "<b>👤 Участнику</b>\n"
+        "• <b>/моиб</b> | баланс\n"
+        "• <b>/топб</b> | топ баллов\n"
+        "• <b>/передать</b> | перевод баллов\n"
+    )
+
+    if role == "member":
+        return header + common
+
+    admin1 = (
+        "\n<b>🌐 Админу 1 уровня</b>\n"
+        "• <b>/инфо</b> | баланс участника\n"
+    )
+
+    if role == "admin1":
+        return header + common + admin1
+
+    admin2 = (
+        "\n<b>🌐 Админу 2 уровня</b>\n"
+        "• <b>/балл</b> | начислить / снять баллы\n"
+        "• <b>/баллм</b> | массовое изменение\n"
+        "• <b>/стартбаллы</b> | стартовые баллы чата\n"
+        "• <b>/админ</b> | выдать админа 1 уровня\n"
+        "• <b>/повысить</b> | выдать админа 2 уровня\n"
+        "• <b>/разжаловать</b> | снять админку\n"
+        "• <b>/бадмины</b> | список админов\n"
+    )
+
+    if role == "owner":
+        owner = "\n<b>👑 Владельцу</b>\n• Полный доступ в любом чате\n"
+        return header + owner + common + admin1 + admin2
+
+    return header + common + admin1 + admin2
+
+
 def get_top_keyboard(current_page: int, total_pages: int, user_id: int):
     builder = InlineKeyboardBuilder()
+
     if current_page > 0:
         builder.button(text="⬅️", callback_data=f"top:{user_id}:{current_page - 1}")
+
+    builder.button(text="🏠 Меню", callback_data=f"menu:{user_id}:main")
+
     if current_page < total_pages - 1:
         builder.button(text="➡️", callback_data=f"top:{user_id}:{current_page + 1}")
-    builder.adjust(2)
+
+    builder.adjust(3)
     return builder.as_markup()
 
 
@@ -303,7 +407,7 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
     if not top:
         return await message.answer("💠 Список лидеров пока пуст.")
 
-    res = [f"🏆 <b>ТОП ЛИДЕРОВ</b> <i>({page + 1}/{total_pages})</i>\n"]
+    res = [f"💠 <b>ТОП ЛИДЕРОВ</b> <i>({page + 1}/{total_pages})</i>\n"]
     for i, row in enumerate(top, 1 + offset):
         uid, name, pts, username = row["user_id"], row["name"], row["points"], row["username"]
         if username:
@@ -321,56 +425,8 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
         await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
-def help_block(title: str, lines: list[str]) -> str:
-    body = "\n".join([f"• {x}" for x in lines])
-    return f"<b>{title}</b>\n{body}\n"
-
-
-def build_help(role: str, lvl: int, join_points: int) -> str:
-    header = (
-        "<b>💠 Меню бота баллов</b>\n"
-        f"🧩 Стартовые баллы: <b>{join_points}</b>\n"
-        f"🔒 Лимит баланса: <b>{BALANCE_MIN}</b>–<b>{BALANCE_MAX}</b>\n"
-        f"🔁 Курс перевода: <b>{TRANSFER_RATE}:1</b>\n\n"
-    )
-
-    common = help_block("👤 Участнику", [
-        "<code>/моиб</code> — баланс",
-        "<code>/топб</code> — лидеры",
-        "<code>/передать</code> — перевод баллов",
-    ])
-
-    if role == "member":
-        return header + common
-
-    admin1 = help_block("🛡 Админу 1 уровня", [
-        "<code>/инфо</code> — баланс участника",
-    ])
-
-    if role == "admin1":
-        return header + common + admin1
-
-    admin2 = help_block("🛡 Админу 2 уровня", [
-        "<code>/балл</code> — начислить/снять баллы",
-        "<code>/баллм</code> — массово начислить/снять",
-        "<code>/стартбаллы</code> — стартовые баллы чата",
-        "<code>/админ</code> — выдать админа 1 уровня",
-        "<code>/повысить</code> — выдать админа 2 уровня",
-        "<code>/разжаловать</code> — снять админку",
-        "<code>/бадмины</code> — список админов",
-    ])
-
-    if role == "owner":
-        owner = help_block("👑 Владельцу", [
-            "Полный доступ в любом чате",
-        ])
-        return header + owner + common + admin1 + admin2
-
-    return header + common + admin1 + admin2
-
-
-@dp.message(Command("start", "help", "bhelp", "бпомощь"))
-async def cmd_help(message: types.Message):
+@dp.message(Command("start", "help", "bhelp", "бпомощь", "меню", "menu"))
+async def cmd_menu(message: types.Message):
     await update_user_data(
         message.from_user.id,
         message.chat.id,
@@ -379,19 +435,63 @@ async def cmd_help(message: types.Message):
     )
 
     lvl = await get_admin_level(message.from_user.id, message.chat.id)
-    jp = await get_join_points(message.chat.id)
+    role = get_role_and_lvl(message.from_user.id, lvl)
 
-    if message.from_user.id == OWNER_ID:
-        text = build_help("owner", lvl, jp)
-    elif lvl >= 2:
-        text = build_help("admin2", lvl, jp)
-    elif lvl >= 1:
-        text = build_help("admin1", lvl, jp)
-    else:
-        text = build_help("member", lvl, jp)
+    text = "<b>💠 Меню бота баллов</b>\nВыбери раздел кнопками ниже."
+    await message.answer(
+        text,
+        reply_markup=main_menu_kb(message.from_user.id),
+        disable_web_page_preview=True
+    )
 
-    await message.answer(text, disable_web_page_preview=True)
 
+@dp.callback_query(F.data.startswith("menu:"))
+async def menu_handler(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    owner_id = int(parts[1])
+
+    if callback.from_user.id != owner_id:
+        return await callback.answer()
+
+    action = parts[2]
+
+    lvl = await get_admin_level(callback.from_user.id, callback.message.chat.id)
+    role = get_role_and_lvl(callback.from_user.id, lvl)
+    jp = await get_join_points(callback.message.chat.id)
+
+    if action == "main":
+        text = "<b>💠 Меню бота баллов</b>\nВыбери раздел кнопками ниже."
+        await callback.message.edit_text(
+            text,
+            reply_markup=main_menu_kb(owner_id),
+            disable_web_page_preview=True
+        )
+        return await callback.answer()
+
+    if action == "help":
+        text = build_help(role, lvl, jp)
+        await callback.message.edit_text(
+            text,
+            reply_markup=main_menu_kb(owner_id),
+            disable_web_page_preview=True
+        )
+        return await callback.answer()
+
+    if action == "stats":
+        text = await get_my_stats_text(callback.from_user.id, callback.message.chat.id)
+        await callback.message.edit_text(
+            text,
+            reply_markup=main_menu_kb(owner_id),
+            disable_web_page_preview=True
+        )
+        return await callback.answer()
+
+    if action == "top":
+        page = int(parts[3]) if len(parts) > 3 else 0
+        await send_top_page(callback.message, page, owner_id=owner_id, edit=True)
+        return await callback.answer()
+
+    await callback.answer()
 
 
 @dp.message(Command("стартбаллы", "joinpoints"))
@@ -403,13 +503,13 @@ async def set_join_points_cmd(message: types.Message):
     if len(args) < 2:
         jp = await get_join_points(message.chat.id)
         return await message.reply(
-            f"Текущие стартовые баллы: <b>{jp}</b>\nУстановить: <code>/стартбаллы 50</code>"
+            f"Текущие стартовые баллы | <b>{jp}</b>\nУстановить | <b>/стартбаллы</b> 50"
         )
 
     try:
         jp = int(args[1])
     except ValueError:
-        return await message.reply("Введите число. Пример: <code>/стартбаллы 50</code>")
+        return await message.reply("Введите число. Пример: <b>/стартбаллы</b> 50")
 
     jp = max(BALANCE_MIN, min(BALANCE_MAX, jp))
 
@@ -434,7 +534,7 @@ async def my_points(message: types.Message):
         )
     if points is None:
         points = await get_join_points(message.chat.id)
-    await message.reply(f"💠 {message.from_user.first_name}, у тебя <b>{points}</b> баллов.")
+    await message.reply(f"💠 {message.from_user.first_name} | у тебя <b>{points}</b> баллов.")
 
 
 @dp.message(Command("инфо", "stats"))
@@ -444,7 +544,7 @@ async def check_stats(message: types.Message):
 
     tid, tname, tuname, err = await resolve_target(message, message.text.split())
     if err == "no_target":
-        return await message.reply("⚠️ Укажи @username или ответь на сообщение.\nПример: <code>/инфо @user</code>")
+        return await message.reply("⚠️ Укажи @username или ответь на сообщение.")
     if err == "not_found":
         return await message.reply("❌ Пользователь не найден. Пусть он напишет сообщение в любой чат с ботом.")
     if err == "not_in_chat":
@@ -464,8 +564,8 @@ async def check_stats(message: types.Message):
     user_link = silent_link(tname, tid)
     await message.answer(
         f"<b>📊 Информация</b>\n"
-        f"👤 Пользователь: {user_link}\n"
-        f"💠 Баланс: <b>{points}</b> баллов",
+        f"👤 Пользователь | {user_link}\n"
+        f"💠 Баланс | <b>{points}</b>",
         disable_web_page_preview=True
     )
 
@@ -499,12 +599,12 @@ async def transfer_points(message: types.Message):
 
     args = message.text.split()
     if len(args) < 2:
-        return await message.reply("Используй: <code>/передать 30 @username</code> или ответом: <code>/передать 30</code>")
+        return await message.reply("Используй | <b>/передать</b> 30 @username (или ответом: <b>/передать</b> 30)")
 
     try:
         amount = int(args[1])
     except ValueError:
-        return await message.reply("Ошибка! Пример: <code>/передать 30 @username</code>")
+        return await message.reply("Ошибка! Используй | <b>/передать</b> 30 @username")
 
     if amount <= 0:
         return await message.reply("Введите положительное число.")
@@ -525,7 +625,7 @@ async def transfer_points(message: types.Message):
 
     received_raw = amount // TRANSFER_RATE
     if received_raw <= 0:
-        return await message.reply(f"Минимальный перевод: <b>{TRANSFER_RATE}</b> (тогда получатель получит <b>1</b> балл).")
+        return await message.reply(f"Минимальный перевод | <b>{TRANSFER_RATE}</b> (получит <b>1</b> балл).")
 
     async with pool.acquire() as conn:
         sender_pts = await conn.fetchval(
@@ -545,10 +645,10 @@ async def transfer_points(message: types.Message):
     if target_pts + received_raw > BALANCE_MAX:
         can = max(0, BALANCE_MAX - target_pts)
         return await message.reply(
-            f"❌ Перевод невозможен: у получателя будет больше <b>{BALANCE_MAX}</b> баллов.\n"
-            f"Сейчас у получателя: <b>{target_pts}</b>.\n"
-            f"Он может принять максимум: <b>{can}</b>.\n"
-            f"Ты хотел перевести (получит): <b>{received_raw}</b>."
+            f"❌ Перевод невозможен | будет больше <b>{BALANCE_MAX}</b>.\n"
+            f"Сейчас | <b>{target_pts}</b>\n"
+            f"Максимум принять | <b>{can}</b>\n"
+            f"Ты хотел (получит) | <b>{received_raw}</b>"
         )
 
     actual_received = received_raw
@@ -556,9 +656,10 @@ async def transfer_points(message: types.Message):
 
     if sender_pts - actual_spent < MIN_POINTS_TO_TRANSFER:
         return await message.reply(
-            f"❌ Нельзя перевести: после перевода у тебя должно остаться "
-            f"<b>не меньше {MIN_POINTS_TO_TRANSFER}</b> баллов.\n"
-            f"Сейчас: <b>{sender_pts}</b>, спишется: <b>{actual_spent}</b>, останется: <b>{sender_pts - actual_spent}</b>."
+            f"❌ После перевода должно остаться минимум <b>{MIN_POINTS_TO_TRANSFER}</b>.\n"
+            f"Сейчас | <b>{sender_pts}</b>\n"
+            f"Спишется | <b>{actual_spent}</b>\n"
+            f"Останется | <b>{sender_pts - actual_spent}</b>"
         )
 
     if sender_pts < actual_spent:
@@ -581,12 +682,11 @@ async def transfer_points(message: types.Message):
 
     text = (
         f"💠 <b>Подтверждение перевода</b>\n\n"
-        f"👤 Отправитель: {sender_l}\n"
-        f"🎯 Получатель: {target_l}\n\n"
-        f"📉 Спишется у отправителя: <b>{actual_spent}</b>\n"
-        f"📈 Получит получатель: <b>{actual_received}</b>\n"
-        f"🔁 Курс: <b>{TRANSFER_RATE}:1</b>\n\n"
-        f"Подтвердить перевод?"
+        f"👤 Отправитель | {sender_l}\n"
+        f"🎯 Получатель | {target_l}\n\n"
+        f"📉 Спишется | <b>{actual_spent}</b>\n"
+        f"📈 Получит | <b>{actual_received}</b>\n"
+        f"🔁 Курс | <b>{TRANSFER_RATE}:1</b>\n"
     )
 
     await message.answer(text, reply_markup=transfer_confirm_kb(token), disable_web_page_preview=True)
@@ -628,20 +728,18 @@ async def transfer_confirm(callback: types.CallbackQuery):
 
         if target_pts + actual_received > BALANCE_MAX:
             pending_transfers.pop(token, None)
-            await callback.message.edit_text(
-                f"❌ Перевод невозможен: у получателя будет больше {BALANCE_MAX} баллов."
-            )
+            await callback.message.edit_text(f"❌ Перевод невозможен | больше {BALANCE_MAX}.")
             return await callback.answer()
 
         if sender_pts < actual_spent:
             pending_transfers.pop(token, None)
-            await callback.message.edit_text("❌ Перевод невозможен: недостаточно баллов у отправителя.")
+            await callback.message.edit_text("❌ Перевод невозможен | недостаточно баллов у отправителя.")
             return await callback.answer()
 
         if sender_pts - actual_spent < MIN_POINTS_TO_TRANSFER:
             pending_transfers.pop(token, None)
             await callback.message.edit_text(
-                f"❌ Перевод невозможен: после перевода у отправителя должно остаться минимум {MIN_POINTS_TO_TRANSFER} баллов."
+                f"❌ Перевод невозможен | после перевода минимум {MIN_POINTS_TO_TRANSFER}."
             )
             return await callback.answer()
 
@@ -669,20 +767,18 @@ async def transfer_confirm(callback: types.CallbackQuery):
 
     await log_to_owner(
         "🧾 <b>Лог перевода баллов</b>\n"
-        f"🏷 Чат: <b>{chat_title}</b> (<code>{req['chat_id']}</code>)\n"
-        f"👤 Отправитель: {sender_l} (<code>{req['sender_id']}</code>)\n"
-        f"🎯 Получатель: {target_l} (<code>{req['target_id']}</code>)\n"
-        f"📈 Получено: <b>{actual_received}</b>\n"
-        f"📉 Списано: <b>{actual_spent}</b> (курс {TRANSFER_RATE}:1)\n"
-        f"💠 Балансы после:\n"
-        f"   • отправитель: <b>{new_sender}</b>\n"
-        f"   • получатель: <b>{new_target}</b>"
+        f"🏷 Чат | <b>{chat_title}</b> (<code>{req['chat_id']}</code>)\n"
+        f"👤 Отправитель | {sender_l} (<code>{req['sender_id']}</code>)\n"
+        f"🎯 Получатель | {target_l} (<code>{req['target_id']}</code>)\n"
+        f"📈 Получено | <b>{actual_received}</b>\n"
+        f"📉 Списано | <b>{actual_spent}</b> (курс {TRANSFER_RATE}:1)\n"
+        f"💠 После | отправитель <b>{new_sender}</b> | получатель <b>{new_target}</b>"
     )
 
     await callback.message.edit_text(
         f"✅ Перевод выполнен!\n"
-        f"💠 {sender_l} передал {target_l} <b>{actual_received}</b> балл(ов).\n"
-        f"📉 Списано: <b>{actual_spent}</b> (курс {TRANSFER_RATE}:1)",
+        f"💠 {sender_l} передал {target_l} <b>{actual_received}</b> балл(ов)\n"
+        f"📉 Списано | <b>{actual_spent}</b> (курс {TRANSFER_RATE}:1)",
         disable_web_page_preview=True
     )
     await callback.answer()
