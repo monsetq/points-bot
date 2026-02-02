@@ -128,15 +128,34 @@ async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL)
     async with pool.acquire() as conn:
+        await conn.execute("CREATE SEQUENCE IF NOT EXISTS users_join_seq")
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT,
             chat_id BIGINT,
+            join_seq BIGINT NOT NULL DEFAULT nextval('users_join_seq'),
             points INT DEFAULT 0,
             name TEXT,
             username TEXT,
             PRIMARY KEY (user_id, chat_id)
         )
+        """)
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS join_seq BIGINT")
+        await conn.execute("ALTER TABLE users ALTER COLUMN join_seq SET DEFAULT nextval('users_join_seq')")
+        await conn.execute("""
+        WITH maxs AS (
+            SELECT COALESCE(MAX(join_seq), 0) AS m FROM users
+        ),
+        numbered AS (
+            SELECT u.user_id, u.chat_id,
+                   (SELECT m FROM maxs) + row_number() OVER (ORDER BY u.chat_id, u.user_id) AS newseq
+            FROM users u
+            WHERE u.join_seq IS NULL
+        )
+        UPDATE users u
+        SET join_seq = n.newseq
+        FROM numbered n
+        WHERE u.user_id = n.user_id AND u.chat_id = n.chat_id
         """)
 
         await conn.execute("""
@@ -145,6 +164,8 @@ async def init_db():
             join_points INT NOT NULL DEFAULT 50
         )
         """)
+
+        await conn.execute("ALTER TABLE chat_settings ADD COLUMN IF NOT EXISTS rating_text TEXT")
 
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS admins_v2 (
@@ -211,6 +232,31 @@ async def get_join_points(chat_id: int) -> int:
             )
             return 50
         return int(jp)
+
+async def get_rating_text(chat_id: int) -> str:
+    async with pool.acquire() as conn:
+        txt = await conn.fetchval("SELECT rating_text FROM chat_settings WHERE chat_id = $1", chat_id)
+        if txt is None:
+            await conn.execute(
+                "INSERT INTO chat_settings (chat_id, join_points, rating_text) VALUES ($1, 50, NULL) "
+                "ON CONFLICT (chat_id) DO NOTHING",
+                chat_id
+            )
+            return RATING_INFO_TEXT
+        txt = str(txt).strip()
+        return txt if txt else RATING_INFO_TEXT
+
+
+async def set_rating_text(chat_id: int, new_text: str):
+    new_text = (new_text or "").strip()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO chat_settings (chat_id, join_points, rating_text) VALUES ($1, 50, $2) "
+            "ON CONFLICT (chat_id) DO UPDATE SET rating_text = EXCLUDED.rating_text",
+            chat_id,
+            new_text
+        )
+
 
 
 async def update_user_data(user_id: int, chat_id: int, name: str, username: str | None = None):
@@ -407,18 +453,23 @@ async def get_my_stats_text(user_id: int, chat_id: int) -> str:
     total = int(total) if total is not None else 0
 
     status = get_point_role(int(points))
+    mute_delta, warn_delta = calc_punishment_adjust(int(points))
 
     return (
         "<b>📊 Моя статистика</b>\n"
         f"💠 Баланс | <b>{points}</b>\n"
         f"😎 Статус | <b>{status}</b>\n"
-        f"🏅 Место | <b>{place}</b> из <b>{total}</b>\n"
+        f"🏅 Место | <b>{place}</b> из <b>{total}</b>\n\n"
+        "<b>⏱ Коррекция наказания</b>\n"
+        f"🔇 Мут | <b>{fmt_minutes(mute_delta)}</b>\n"
+        f"⚠️ Варн | <b>{fmt_days(warn_delta)}</b>\n"
     )
 
 
 def build_help(role: str, lvl: int, join_points: int) -> str:
     header = (
         "<b>📖 Команды бота</b>\n"
+        "💠 Правила рейтинга | кнопка <b>«💠 О рейтинге»</b> в меню\n\n"
     )
 
     common = (
@@ -488,7 +539,7 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
 
         top = await conn.fetch(
             "SELECT user_id, name, points, username FROM users "
-            "WHERE chat_id = $1 ORDER BY points DESC LIMIT $2 OFFSET $3",
+            "WHERE chat_id = $1 ORDER BY points DESC, join_seq ASC LIMIT $2 OFFSET $3",
             message.chat.id, ITEMS_PER_PAGE, offset
         )
 
@@ -501,7 +552,6 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
         name = row["name"]
         pts = row["points"]
         username = row["username"]
-    
         if uid == MENTION_IN_TOP_USER_ID:
             user_link = f'<a href="tg://user?id={uid}">{name}</a>'
         else:
@@ -509,9 +559,7 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
                 user_link = hlink(name, f"https://t.me/{username}")
             else:
                 user_link = name
-
         res.append(f"{i}. {user_link} | {hbold(pts)}")
-
 
 
     text = "\n".join(res)
@@ -523,7 +571,7 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
         await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
-@dp.message(Command("start", "bhelp", "бпомощь", "менюб", "menub"))
+@dp.message(Command("start", "help", "bhelp", "бпомощь", "меню", "menu"))
 async def cmd_menu(message: types.Message):
     await update_user_data(
         message.from_user.id,
@@ -536,6 +584,34 @@ async def cmd_menu(message: types.Message):
         reply_markup=main_menu_kb(message.from_user.id),
         disable_web_page_preview=True
     )
+
+
+
+@dp.message(F.text.startswith("+рейтинг"))
+async def edit_rating_cmd(message: types.Message):
+    if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
+        return
+
+    new_text = ""
+    if message.reply_to_message and message.reply_to_message.text:
+        new_text = message.reply_to_message.text.strip()
+    else:
+        raw = (message.text or "").strip()
+        new_text = raw[len("+рейтинг"):].strip()
+
+    if not new_text:
+        current = await get_rating_text(message.chat.id)
+        return await message.reply(
+            "<b>💠 О рейтинге (текущая версия)</b>\n\n"
+            f"{current}\n\n"
+            "Чтобы изменить — отправь:\n"
+            "• <b>+рейтинг</b> <i>текст</i>\n"
+            "или ответь на сообщение с текстом командой <b>+рейтинг</b>",
+            disable_web_page_preview=True
+        )
+
+    await set_rating_text(message.chat.id, new_text)
+    await message.reply("✅ Текст <b>«О рейтинге»</b> обновлён.", disable_web_page_preview=True)
 
 
 @dp.callback_query(F.data.startswith("menu:"))
@@ -571,7 +647,7 @@ async def menu_handler(callback: types.CallbackQuery):
 
     if action == "rating":
         await callback.message.edit_text(
-            RATING_INFO_TEXT,
+            await get_rating_text(callback.message.chat.id),
             reply_markup=main_menu_kb(owner_id),
             disable_web_page_preview=True
         )
@@ -626,28 +702,24 @@ async def set_join_points_cmd(message: types.Message):
 
 @dp.message(Command("моиб", "myb"))
 async def my_points(message: types.Message):
-    await update_user_data(
-        message.from_user.id,
-        message.chat.id,
-        message.from_user.first_name,
-        message.from_user.username
-    )
-
+    await update_user_data(message.from_user.id, message.chat.id, message.from_user.first_name, message.from_user.username)
     async with pool.acquire() as conn:
         points = await conn.fetchval(
             "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
             message.from_user.id, message.chat.id
         )
-
     if points is None:
         points = await get_join_points(message.chat.id)
 
     status = get_point_role(int(points))
+    mute_delta, warn_delta = calc_punishment_adjust(int(points))
 
     await message.reply(
         f"💠 {message.from_user.first_name}\n"
         f"Баланс | <b>{points}</b>\n"
-        f"Статус | <b>{status}</b>",
+        f"Статус | <b>{status}</b>\n\n"
+        f"🔇 Мут | <b>{fmt_minutes(mute_delta)}</b>\n"
+        f"⚠️ Варн | <b>{fmt_days(warn_delta)}</b>",
         disable_web_page_preview=True
     )
 
