@@ -32,7 +32,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 pool = None
 
 
-# ------------------ Роли по баллам ------------------
 POINT_ROLES = [
     (0, 49, "😈 Плохиш"),
     (50, 69, "👌 Нормис"),
@@ -93,7 +92,6 @@ def fmt_days(delta: int) -> str:
     return f"{sign}{abs(delta)} дн"
 
 
-# ------------------ Текст "О рейтинге" ------------------
 RATING_INFO_TEXT = (
     "<b>💠 Социальный рейтинг</b>\n\n"
     "• Влияет на наказания и статус в чате\n"
@@ -124,7 +122,6 @@ RATING_INFO_TEXT = (
 )
 
 
-# ---------------------- DB ----------------------
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL)
@@ -156,7 +153,6 @@ async def init_db():
         )
         """)
 
-        # миграция старой admins (если была)
         try:
             await conn.execute("""
             INSERT INTO admins_v2 (chat_id, user_id, level)
@@ -380,7 +376,6 @@ def get_role_and_lvl(user_id: int, lvl: int) -> str:
     return "member"
 
 
-# ---------------------- Меню ----------------------
 def main_menu_kb(owner_id: int):
     b = InlineKeyboardBuilder()
     b.button(text="📖 Команды", callback_data=f"menu:{owner_id}:help")
@@ -410,21 +405,16 @@ async def get_my_stats_text(user_id: int, chat_id: int) -> str:
     total = int(total) if total is not None else 0
 
     status = get_point_role(int(points))
-    mute_delta, warn_delta = calc_punishment_adjust(int(points))
 
     return (
         "<b>📊 Моя статистика</b>\n"
         f"💠 Баланс | <b>{points}</b>\n"
         f"😎 Статус | <b>{status}</b>\n"
-        f"🏅 Место | <b>{place}</b> из <b>{total}</b>\n\n"
-        "<b>⏱ Коррекция наказания</b>\n"
-        f"🔇 Мут | <b>{fmt_minutes(mute_delta)}</b>\n"
-        f"⚠️ Варн | <b>{fmt_days(warn_delta)}</b>\n"
+        f"🏅 Место | <b>{place}</b> из <b>{total}</b>\n"
     )
 
 
 def build_help(role: str, lvl: int, join_points: int) -> str:
-    # без “старт/лимит/курс” в шапке — только по делу
     header = (
         "<b>📖 Команды бота</b>\n"
         "💠 Правила рейтинга | кнопка <b>«💠 О рейтинге»</b> в меню\n\n"
@@ -522,8 +512,7 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
         await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
-# ---------------------- Handlers ----------------------
-@dp.message(Command("start", "help", "bhelp", "бпомощь", "меню", "menu"))
+@dp.message(Command("start", "bhelp", "бпомощь", "менюб", "menub"))
 async def cmd_menu(message: types.Message):
     await update_user_data(
         message.from_user.id,
@@ -626,24 +615,28 @@ async def set_join_points_cmd(message: types.Message):
 
 @dp.message(Command("моиб", "myb"))
 async def my_points(message: types.Message):
-    await update_user_data(message.from_user.id, message.chat.id, message.from_user.first_name, message.from_user.username)
+    await update_user_data(
+        message.from_user.id,
+        message.chat.id,
+        message.from_user.first_name,
+        message.from_user.username
+    )
+
     async with pool.acquire() as conn:
         points = await conn.fetchval(
             "SELECT points FROM users WHERE user_id = $1 AND chat_id = $2",
             message.from_user.id, message.chat.id
         )
+
     if points is None:
         points = await get_join_points(message.chat.id)
 
     status = get_point_role(int(points))
-    mute_delta, warn_delta = calc_punishment_adjust(int(points))
 
     await message.reply(
         f"💠 {message.from_user.first_name}\n"
         f"Баланс | <b>{points}</b>\n"
-        f"Статус | <b>{status}</b>\n\n"
-        f"🔇 Мут | <b>{fmt_minutes(mute_delta)}</b>\n"
-        f"⚠️ Варн | <b>{fmt_days(warn_delta)}</b>",
+        f"Статус | <b>{status}</b>",
         disable_web_page_preview=True
     )
 
@@ -706,7 +699,6 @@ async def process_top_pagination(callback: types.CallbackQuery):
     await callback.answer()
 
 
-# ---------------------- Transfer / Points logic (ниже твой код без ломки) ----------------------
 @dp.message(Command("передать", "pay"))
 async def transfer_points(message: types.Message):
     await update_user_data(
