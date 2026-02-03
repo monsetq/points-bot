@@ -764,9 +764,6 @@ async def build_my_stats(user_id: int, chat_id: int) -> RichText:
     b.add("🪙 Баланс | ").bold(points).add("\n")
     b.add("😎 Статус | ").bold(status).add("\n")
     b.add("🏅 Место | ").bold(place).add(" из ").bold(total).add("\n\n")
-    b.bold("⏱ Коррекция наказания").add("\n")
-    b.add("🔇 Мут | ").bold(fmt_minutes(mute_delta)).add("\n")
-    b.add("⚠️ Варн | ").bold(fmt_days(warn_delta)).add("\n")
     return b
 
 
