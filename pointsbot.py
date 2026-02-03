@@ -306,10 +306,8 @@ async def set_chat_emoji(chat_id: int, emoji_text: str, custom_emoji_id: str, en
                           enabled = EXCLUDED.enabled
         """, chat_id, emoji_text, custom_emoji_id, bool(enabled))
 
-    if chat_id == 0:
-        _EMOJI_CACHE.clear()
-    else:
-        _EMOJI_CACHE = None
+    global _EMOJI_CACHE
+    _EMOJI_CACHE = None
 
 
 async def toggle_chat_emoji(chat_id: int, emoji_text: str, enabled: bool):
@@ -325,10 +323,8 @@ async def toggle_chat_emoji(chat_id: int, emoji_text: str, enabled: bool):
             DO UPDATE SET enabled = EXCLUDED.enabled
         """, chat_id, emoji_text, bool(enabled))
 
-    if chat_id == 0:
-        _EMOJI_CACHE.clear()
-    else:
-        _EMOJI_CACHE = None
+    global _EMOJI_CACHE
+    _EMOJI_CACHE = None
 
 
 async def delete_chat_emoji(chat_id: int, emoji_text: str):
@@ -339,10 +335,8 @@ async def delete_chat_emoji(chat_id: int, emoji_text: str):
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM chat_emojis WHERE chat_id = $1 AND emoji_text = $2", chat_id, emoji_text)
 
-    if chat_id == 0:
-        _EMOJI_CACHE.clear()
-    else:
-        _EMOJI_CACHE = None
+    global _EMOJI_CACHE
+    _EMOJI_CACHE = None
 
 
 POINT_ROLES = [
