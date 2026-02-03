@@ -39,7 +39,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 pool = None
 
 
-PLACEHOLDER = " " 
+PLACEHOLDER = "⬜"
 
 @dataclass
 class RichText:
@@ -278,12 +278,11 @@ async def apply_custom_emojis(
 
     ents = [types.MessageEntity(**en.model_dump()) for en in entities]
 
-    for s, e, emoji_text, custom_id in selected:
+    for s, e, key, custom_id in selected:
         old_len = e - s
         text = text[:s] + PLACEHOLDER + text[e:]
 
         delta = 1 - old_len
-
         ents = _adjust_entities_for_replacement(ents, s, e, delta)
 
         ents.append(types.MessageEntity(
