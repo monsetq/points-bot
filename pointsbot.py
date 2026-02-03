@@ -125,7 +125,7 @@ async def send_rich(message_or_cbmsg, rich: RichText, reply_markup=None, edit: b
     Перед отправкой автоматически заменяет настроенные эмодзи на custom_emoji.
     """
     final_text, final_entities = await apply_custom_emojis(
-        chat_id=message_or_cbmsg.chat.id,
+        chat_id=0,
         text=rich.text,
         entities=rich.entities
     )
@@ -149,44 +149,13 @@ async def send_rich(message_or_cbmsg, rich: RichText, reply_markup=None, edit: b
     parse_mode=None
         )
 
-
-_EMOJI_CACHE: Dict[int, Tuple[float, Dict[str, Tuple[str, bool]]]] = {}
-_EMOJI_CACHE_TTL = 10.0 
-
-async def get_emoji_map(chat_id: int) -> Dict[str, Tuple[str, bool]]:
-    """
-    returns dict: emoji_text -> (custom_emoji_id, enabled)
-    """
-    now = time.time()
-    cached = _EMOJI_CACHE.get(chat_id)
-    if cached and (now - cached[0]) < _EMOJI_CACHE_TTL:
-        return cached[1]
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT emoji_text, custom_emoji_id, enabled FROM chat_emojis WHERE chat_id = $1",
-            chat_id
-        )
-
-    m: Dict[str, Tuple[str, bool]] = {}
-    for r in rows:
-        et = str(r["emoji_text"])
-        cid = r["custom_emoji_id"]
-        en = bool(r["enabled"])
-        if cid:
-            m[et] = (str(cid), en)
-
-    _EMOJI_CACHE[chat_id] = (now, m)
-    return m
-
-
 def _adjust_entities_for_replacement(
-    entities: List[types.MessageEntity],
+    entities: list[types.MessageEntity],
     s: int,
     e: int,
     delta: int
-) -> List[types.MessageEntity]:
-    new_ents: List[types.MessageEntity] = []
+) -> list[types.MessageEntity]:
+    new_ents = []
 
     for ent in entities:
         ent_start = int(ent.offset)
@@ -230,9 +199,35 @@ def _adjust_entities_for_replacement(
     return new_ents
 
 
-def _overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
-    return not (a_end <= b_start or b_end <= a_start)
+_EMOJI_CACHE: Tuple[float, Dict[str, Tuple[str, bool]]] | None = None
+_EMOJI_CACHE_TTL = 10.0
 
+async def get_emoji_map(chat_id: int = 0) -> Dict[str, Tuple[str, bool]]:
+    """
+    Глобальные эмодзи для всех чатов: читаем только chat_id = 0.
+    returns dict: emoji_text -> (custom_emoji_id, enabled)
+    """
+    global _EMOJI_CACHE
+    now = time.time()
+
+    if _EMOJI_CACHE and (now - _EMOJI_CACHE[0]) < _EMOJI_CACHE_TTL:
+        return _EMOJI_CACHE[1]
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT emoji_text, custom_emoji_id, enabled FROM chat_emojis WHERE chat_id = 0"
+        )
+
+    m: Dict[str, Tuple[str, bool]] = {}
+    for r in rows:
+        et = str(r["emoji_text"])
+        cid = r["custom_emoji_id"]
+        en = bool(r["enabled"])
+        if cid:
+            m[et] = (str(cid), en)
+
+    _EMOJI_CACHE = (now, m)
+    return m
 
 async def apply_custom_emojis(
     chat_id: int,
@@ -297,6 +292,7 @@ async def apply_custom_emojis(
 
 
 async def set_chat_emoji(chat_id: int, emoji_text: str, custom_emoji_id: str, enabled: bool = True):
+    global _EMOJI_CACHE
     emoji_text = (emoji_text or "").strip()
     custom_emoji_id = (custom_emoji_id or "").strip()
     if not emoji_text:
@@ -313,10 +309,11 @@ async def set_chat_emoji(chat_id: int, emoji_text: str, custom_emoji_id: str, en
     if chat_id == 0:
         _EMOJI_CACHE.clear()
     else:
-        _EMOJI_CACHE.pop(chat_id, None)
+        _EMOJI_CACHE = None
 
 
 async def toggle_chat_emoji(chat_id: int, emoji_text: str, enabled: bool):
+    global _EMOJI_CACHE
     emoji_text = (emoji_text or "").strip()
     if not emoji_text:
         return
@@ -331,10 +328,11 @@ async def toggle_chat_emoji(chat_id: int, emoji_text: str, enabled: bool):
     if chat_id == 0:
         _EMOJI_CACHE.clear()
     else:
-        _EMOJI_CACHE.pop(chat_id, None)
+        _EMOJI_CACHE = None
 
 
 async def delete_chat_emoji(chat_id: int, emoji_text: str):
+    global _EMOJI_CACHE
     emoji_text = (emoji_text or "").strip()
     if not emoji_text:
         return
@@ -344,7 +342,7 @@ async def delete_chat_emoji(chat_id: int, emoji_text: str):
     if chat_id == 0:
         _EMOJI_CACHE.clear()
     else:
-        _EMOJI_CACHE.pop(chat_id, None)
+        _EMOJI_CACHE = None
 
 
 POINT_ROLES = [
@@ -875,45 +873,29 @@ async def premium_emoji_cmd(message: types.Message):
     parts = (message.text or "").split()
 
     is_global = len(parts) >= 2 and parts[1].lower() in ("глоб", "global", "g")
+    arg_shift = 1 if is_global else 0
 
-    if is_global:
-        if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
-            return
-        target_chat_id = 0
-        arg_shift = 1
-        scope_name = "🌍 Глобальные"
+    if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
+        return
 
-    else:
-        if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
-            return
-        target_chat_id = message.chat.id
-        arg_shift = 0
-        scope_name = "🏠 Эмодзи этого чата"
-
+    target_chat_id = 0
+    scope_name = "🌍 Глобальные (для всех чатов)"
 
     if len(parts) == 1 or (is_global and len(parts) == 2):
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT emoji_text, custom_emoji_id, enabled FROM chat_emojis WHERE chat_id = $1 ORDER BY emoji_text ASC",
-                target_chat_id
+                "SELECT emoji_text, custom_emoji_id, enabled FROM chat_emojis WHERE chat_id = 0 ORDER BY emoji_text ASC"
             )
 
         b = RichText()
         b.add("🧩 ").bold(f"{scope_name} — настройки").add("\n\n")
-
         b.bold("Команды:").add("\n")
-        if is_global:
-            b.add("• +эмодзи глоб сет «эмодзи» «custom_emoji_id»\n")
-            b.add("• +эмодзи глоб вкл «эмодзи»\n")
-            b.add("• +эмодзи глоб выкл «эмодзи»\n")
-            b.add("• +эмодзи глоб дел «эмодзи»\n\n")
-            b.add("Пример: +эмодзи глоб сет 💠 5409123456789012345\n\n")
-        else:
-            b.add("• +эмодзи сет «эмодзи» «custom_emoji_id»\n")
-            b.add("• +эмодзи вкл «эмодзи»\n")
-            b.add("• +эмодзи выкл «эмодзи»\n")
-            b.add("• +эмодзи дел «эмодзи»\n\n")
-            b.add("Пример: +эмодзи сет 💠 5409123456789012345\n\n")
+        b.add("• +эмодзи сет «триггер(ы)» «custom_emoji_id»\n")
+        b.add("• +эмодзи вкл «триггер(ы)»\n")
+        b.add("• +эмодзи выкл «триггер(ы)»\n")
+        b.add("• +эмодзи дел «триггер(ы)»\n\n")
+        b.add("Алиасы (схожие слова одним эмодзи): ").code("рейтинг|баллы|очки").add("\n")
+        b.add("Пример: ").code("+эмодзи сет рейтинг|баллы|очки 5409123456789012345").add("\n\n")
 
         b.bold("Текущие значения:").add("\n")
         if not rows:
@@ -923,45 +905,45 @@ async def premium_emoji_cmd(message: types.Message):
                 emj = str(r["emoji_text"])
                 cid = r["custom_emoji_id"] or "—"
                 en = "✅" if r["enabled"] else "❌"
-                b.add(f"• {emj} | {en} | ").code(cid).add("\n")
+                b.add(f"• {emj} | {en} | ").code(str(cid)).add("\n")
 
         return await send_rich(message, b)
 
     if len(parts) < 3 + arg_shift:
-        return await message.reply("❌ Не понял. Напиши просто: +эмодзи (или +эмодзи глоб)")
+        return await message.reply("❌ Не понял. Напиши: +эмодзи (или +эмодзи глоб)")
 
     action = parts[1 + arg_shift].lower()
-    emoji_text = parts[2 + arg_shift]
+    raw_key = parts[2 + arg_shift]
+
+    emoji_keys = [x.strip() for x in raw_key.split("|") if x.strip()]
+    if not emoji_keys:
+        return await message.reply("❌ Пустой триггер.")
 
     if action in ("сет", "set"):
         if len(parts) < 4 + arg_shift:
-            if is_global:
-                return await message.reply("Используй: +эмодзи глоб сет «эмодзи» «custom_emoji_id»")
-            return await message.reply("Используй: +эмодзи сет «эмодзи» «custom_emoji_id»")
+            return await message.reply("Используй: +эмодзи сет «триггер(ы)» «custom_emoji_id»")
 
         cid = parts[3 + arg_shift].strip()
-        await set_chat_emoji(target_chat_id, emoji_text, cid, enabled=True)
-        prefix = "🌍 Глобально" if is_global else "🏠 В чате"
-        return await message.reply(f"✅ {prefix}: {emoji_text} → {cid}")
+        for k in emoji_keys:
+            await set_chat_emoji(target_chat_id, k, cid, enabled=True)
+        return await message.reply(f"✅ {scope_name}: {', '.join(emoji_keys)} → {cid}")
 
     if action in ("вкл", "on"):
-        await toggle_chat_emoji(target_chat_id, emoji_text, True)
-        prefix = "🌍 Глобально" if is_global else "🏠 В чате"
-        return await message.reply(f"✅ {prefix} включено: {emoji_text}")
+        for k in emoji_keys:
+            await toggle_chat_emoji(target_chat_id, k, True)
+        return await message.reply(f"✅ {scope_name} включено: {', '.join(emoji_keys)}")
 
     if action in ("выкл", "off"):
-        await toggle_chat_emoji(target_chat_id, emoji_text, False)
-        prefix = "🌍 Глобально" if is_global else "🏠 В чате"
-        return await message.reply(f"✅ {prefix} выключено: {emoji_text}")
+        for k in emoji_keys:
+            await toggle_chat_emoji(target_chat_id, k, False)
+        return await message.reply(f"✅ {scope_name} выключено: {', '.join(emoji_keys)}")
 
     if action in ("дел", "del", "удалить", "remove"):
-        await delete_chat_emoji(target_chat_id, emoji_text)
-        prefix = "🌍 Глобально" if is_global else "🏠 В чате"
-        return await message.reply(f"✅ {prefix} удалено: {emoji_text}")
+        for k in emoji_keys:
+            await delete_chat_emoji(target_chat_id, k)
+        return await message.reply(f"✅ {scope_name} удалено: {', '.join(emoji_keys)}")
 
-    return await message.reply("❌ Не понял команду. Напиши: +эмодзи (или +эмодзи глоб)")
-
-
+    return await message.reply("❌ Не понял команду. Напиши: +эмодзи")
 @dp.message(F.text.startswith("+рейтинг"))
 async def edit_rating_cmd(message: types.Message):
     if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
