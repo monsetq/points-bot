@@ -1056,8 +1056,6 @@ async def my_points(message: types.Message):
     b.add("🪙 ").add(message.from_user.first_name).add("\n")
     b.add("Баланс | ").bold(points).add("\n")
     b.add("Статус | ").bold(status).add("\n\n")
-    b.add("🔇 Мут | ").bold(fmt_minutes(mute_delta)).add("\n")
-    b.add("⚠️ Варн | ").bold(fmt_days(warn_delta))
     await send_rich(message, b)
 
 
