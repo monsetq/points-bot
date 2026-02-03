@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -181,27 +180,65 @@ async def get_emoji_map(chat_id: int) -> Dict[str, Tuple[str, bool]]:
     return m
 
 
-def _shift_entities(entities: List[types.MessageEntity], start: int, delta: int):
-    """
-    Сдвигает offset всех entities, которые начинаются ПОСЛЕ start.
-    delta может быть отрицательным.
-    """
-    if delta == 0:
-        return
-    for e in entities:
-        if e.offset > start:
-            e.offset += delta
+def _adjust_entities_for_replacement(
+    entities: List[types.MessageEntity],
+    s: int,
+    e: int,
+    delta: int
+) -> List[types.MessageEntity]:
+    new_ents: List[types.MessageEntity] = []
+
+    for ent in entities:
+        ent_start = int(ent.offset)
+        ent_len = int(ent.length)
+        ent_end = ent_start + ent_len
+
+        if ent_end <= s:
+            new_ents.append(ent)
+            continue
+
+        if ent_start >= e:
+            ent.offset = ent_start + delta
+            new_ents.append(ent)
+            continue
+
+        if ent_start >= s and ent_end <= e:
+            continue
+
+        if ent_start < s and ent_end <= e:
+            ent.length = max(0, s - ent_start)
+            if ent.length > 0:
+                new_ents.append(ent)
+            continue
+
+        if ent_start >= s and ent_start < e and ent_end > e:
+            tail = ent_end - e
+            ent.offset = s
+            ent.length = 1 + tail
+            if ent.length > 0:
+                new_ents.append(ent)
+            continue
+
+        if ent_start < s and ent_end > e:
+            ent.length = ent_len + delta
+            if ent.length > 0:
+                new_ents.append(ent)
+            continue
+
+        new_ents.append(ent)
+
+    return new_ents
 
 
 def _overlaps(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
     return not (a_end <= b_start or b_end <= a_start)
 
 
-async def apply_custom_emojis(chat_id: int, text: str, entities: List[types.MessageEntity]) -> Tuple[str, List[types.MessageEntity]]:
-    """
-    Автоматически заменяет ВСЕ настроенные emoji_text на custom_emoji entities.
-    Важно: работает с уже существующими entities (bold/link/etc), корректно двигает offset.
-    """
+async def apply_custom_emojis(
+    chat_id: int,
+    text: str,
+    entities: List[types.MessageEntity]
+) -> Tuple[str, List[types.MessageEntity]]:
     emoji_map = await get_emoji_map(chat_id)
     if not emoji_map:
         return text, entities
@@ -212,13 +249,14 @@ async def apply_custom_emojis(chat_id: int, text: str, entities: List[types.Mess
             continue
         if not emoji_text:
             continue
+
         for key in emoji_variants(emoji_text):
             start = 0
             while True:
                 idx = text.find(key, start)
                 if idx == -1:
                     break
-                matches.append((idx, idx + len(key), key, custom_id))
+                matches.append((idx, idx + len(key), key, str(custom_id)))
                 start = idx + len(key)
 
     if not matches:
@@ -227,28 +265,26 @@ async def apply_custom_emojis(chat_id: int, text: str, entities: List[types.Mess
     matches.sort(key=lambda x: (x[0], -(x[1] - x[0])))
 
     selected = []
-    for m in matches:
-        s, e, emj, cid = m
+    for s, e, key, cid in matches:
         ok = True
         for ss, ee, _, _ in selected:
-            if _overlaps(s, e, ss, ee):
+            if not (e <= ss or ee <= s):
                 ok = False
                 break
         if ok:
-            selected.append(m)
+            selected.append((s, e, key, cid))
 
     selected.sort(key=lambda x: x[0], reverse=True)
 
-    ents = [types.MessageEntity(**e.model_dump()) for e in entities]
+    ents = [types.MessageEntity(**en.model_dump()) for en in entities]
 
     for s, e, emoji_text, custom_id in selected:
-        before = text[:s]
-        after = text[e:]
-        text = before + PLACEHOLDER + after
+        old_len = e - s
+        text = text[:s] + PLACEHOLDER + text[e:]
 
-        delta = 1 - len(emoji_text)
+        delta = 1 - old_len
 
-        _shift_entities(ents, s, delta)
+        ents = _adjust_entities_for_replacement(ents, s, e, delta)
 
         ents.append(types.MessageEntity(
             type="custom_emoji",
@@ -685,7 +721,7 @@ def get_role_and_lvl(user_id: int, lvl: int) -> str:
 def main_menu_kb(owner_id: int):
     b = InlineKeyboardBuilder()
     b.button(text="📖 Команды", callback_data=f"menu:{owner_id}:help")
-    b.button(text="💠 О рейтинге", callback_data=f"menu:{owner_id}:rating")
+    b.button(text="❓ О рейтинге", callback_data=f"menu:{owner_id}:rating")
     b.button(text="🏆 Топ", callback_data=f"menu:{owner_id}:top:0")
     b.button(text="📊 Моя статистика", callback_data=f"menu:{owner_id}:stats")
     b.adjust(2, 2)
@@ -734,7 +770,7 @@ async def build_my_stats(user_id: int, chat_id: int) -> RichText:
 
     b = RichText()
     b.add("📊 ").bold("Моя статистика").add("\n")
-    b.add("💠 Баланс | ").bold(points).add("\n")
+    b.add("🪙 Баланс | ").bold(points).add("\n")
     b.add("😎 Статус | ").bold(status).add("\n")
     b.add("🏅 Место | ").bold(place).add(" из ").bold(total).add("\n\n")
     b.bold("⏱ Коррекция наказания").add("\n")
@@ -792,11 +828,11 @@ async def send_top_page(message: types.Message, page: int, owner_id: int, edit: 
         )
 
     if not top:
-        b = RichText().add("💠 Список лидеров пока пуст.")
+        b = RichText().add("🔝 Список лидеров пока пуст.")
         return await send_rich(message, b, edit=False)
 
     b = RichText()
-    b.add("💠 ").bold("ТОП ЛИДЕРОВ").add(f" ({page + 1}/{total_pages})\n\n")
+    b.add("🔝 ").bold("ТОП ЛИДЕРОВ").add(f" ({page + 1}/{total_pages})\n\n")
 
     for i, row in enumerate(top, 1 + offset):
         uid = int(row["user_id"])
@@ -1045,7 +1081,7 @@ async def my_points(message: types.Message):
     mute_delta, warn_delta = calc_punishment_adjust(int(points))
 
     b = RichText()
-    b.add("💠 ").add(message.from_user.first_name).add("\n")
+    b.add("🪙 ").add(message.from_user.first_name).add("\n")
     b.add("Баланс | ").bold(points).add("\n")
     b.add("Статус | ").bold(status).add("\n\n")
     b.add("🔇 Мут | ").bold(fmt_minutes(mute_delta)).add("\n")
@@ -1083,7 +1119,7 @@ async def check_stats(message: types.Message):
     b = RichText()
     b.add("📊 ").bold("Информация").add("\n")
     b.add("👤 Пользователь | ").link(tname, f"tg://user?id={tid}").add("\n")
-    b.add("💠 Баланс | ").bold(points).add("\n")
+    b.add("🪙 Баланс | ").bold(points).add("\n")
     b.add("😎 Статус | ").bold(status).add("\n\n")
     b.bold("⏱ Коррекция наказания по баллам").add("\n")
     b.add("🔇 Мут | ").bold(fmt_minutes(mute_delta)).add("\n")
