@@ -23,6 +23,9 @@ TRANSFER_RATE = 3
 TRANSFER_CONFIRM_TTL = 300
 pending_transfers = {}
 
+
+RESET_CONFIRM_TTL = 300
+pending_resets = {}
 ITEMS_PER_PAGE = 30
 logging.basicConfig(level=logging.INFO)
 
@@ -738,6 +741,14 @@ def transfer_confirm_kb(token: str):
     return builder.as_markup()
 
 
+def reset_confirm_kb(token: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data=f"rconf:{token}")
+    builder.button(text="❌ Отмена", callback_data=f"rcancel:{token}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 async def build_my_stats(user_id: int, chat_id: int) -> RichText:
     async with pool.acquire() as conn:
         points = await conn.fetchval(
@@ -772,29 +783,30 @@ def build_help(role: str) -> RichText:
     b.add("📖 ").bold("Команды бота").add("\n\n")
 
     b.bold("👤 Участнику").add("\n")
-    b.add("• /моиб | баланс\n")
-    b.add("• /топб | топ баллов\n")
-    b.add("• /передать | перевод баллов\n")
+    b.add("• /моиб | /myb | баланс\n")
+    b.add("• /топб | /topb | топ баллов\n")
+    b.add("• /передатьб | /payb | перевод баллов\n")
 
     if role == "member":
         return b
 
     b.add("\n").bold("🌐 Админу 1 уровня").add("\n")
-    b.add("• /инфо | информация по участнику\n")
+    b.add("• /инфо | /info | информация по участнику\n")
 
     if role == "admin1":
         return b
 
     b.add("\n").bold("🌐 Админу 2 уровня").add("\n")
-    b.add("• /балл | начислить / снять баллы\n")
-    b.add("• /баллм | массовое изменение\n")
-    b.add("• /стартбаллы | стартовые баллы чата\n")
-    b.add("• /админ | выдать админа 1 уровня\n")
-    b.add("• /повысить | выдать админа 2 уровня\n")
-    b.add("• /разжаловать | снять админку\n")
-    b.add("• /бадмины | список админов\n")
-    b.add("• +рейтинг | изменить «О рейтинге»\n")
-    b.add("• +эмодзи | настройка premium эмодзи\n")
+    b.add("• /балл | /ball | начислить или снять баллы\n")
+    b.add("• /баллм | /ballm | массовое изменение\n")
+    b.add("• /стартбаллы | /joinpoints | стартовые баллы чата\n")
+    b.add("• /обнулитьбаллы | /resetpoints | сброс всем в стартовые баллы\n")
+    b.add("• /админ | /admin | выдать админа 1 уровня\n")
+    b.add("• /повысить | /promote | выдать админа 2 уровня\n")
+    b.add("• /разжаловать | /unadmin | снять админку\n")
+    b.add("• /бадмины | /badmins | список админов\n")
+    b.add("• /рейтинг | /rating | изменить «О рейтинге»\n")
+    b.add("• /эмодзи | /emoji | настройка premium эмодзи\n")
 
     if role == "owner":
         b.add("\n").bold("👑 Владельцу").add("\n")
@@ -859,18 +871,17 @@ async def cmd_menu(message: types.Message):
     await send_rich(message, b, reply_markup=main_menu_kb(message.from_user.id))
 
 
-@dp.message(F.text.startswith("+эмодзи"))
+@dp.message(Command("эмодзи", "emoji"))
 async def premium_emoji_cmd(message: types.Message):
     parts = (message.text or "").split()
 
     is_global = len(parts) >= 2 and parts[1].lower() in ("глоб", "global", "g")
     arg_shift = 1 if is_global else 0
-
-    if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
+    if message.from_user.id != OWNER_ID:
         return
 
     target_chat_id = 0
-    scope_name = "🌍 Глобальные (для всех чатов)"
+    scope_name = "🌍 Глобальные — для всех чатов"
 
     if len(parts) == 1 or (is_global and len(parts) == 2):
         async with pool.acquire() as conn:
@@ -885,8 +896,8 @@ async def premium_emoji_cmd(message: types.Message):
         b.add("• +эмодзи вкл «триггер(ы)»\n")
         b.add("• +эмодзи выкл «триггер(ы)»\n")
         b.add("• +эмодзи дел «триггер(ы)»\n\n")
-        b.add("Алиасы (схожие слова одним эмодзи): ").code("рейтинг|баллы|очки").add("\n")
-        b.add("Пример: ").code("+эмодзи сет рейтинг|баллы|очки 5409123456789012345").add("\n\n")
+        b.add("Алиасы: ").code("рейтинг|баллы|очки").add("\n")
+        b.add("Пример: ").code("/эмодзи сет рейтинг|баллы|очки 5409123456789012345").add("\n\n")
 
         b.bold("Текущие значения:").add("\n")
         if not rows:
@@ -934,7 +945,7 @@ async def premium_emoji_cmd(message: types.Message):
             await delete_chat_emoji(target_chat_id, k)
         return await message.reply(f"✅ {scope_name} удалено: {', '.join(emoji_keys)}")
 
-    return await message.reply("❌ Не понял команду. Напиши: +эмодзи")
+    return await message.reply("❌ Не понял команду. Напиши: /эмодзи")
 @dp.message(F.text.startswith("+рейтинг"))
 async def edit_rating_cmd(message: types.Message):
     if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
@@ -950,11 +961,11 @@ async def edit_rating_cmd(message: types.Message):
     if not new_text:
         current = await get_rating_text(message.chat.id)
         b = RichText()
-        b.add("💠 ").bold("О рейтинге (текущая версия)").add("\n\n")
+        b.add("💠 ").bold("О рейтинге — текущая версия").add("\n\n")
         b.add(current).add("\n\n")
         b.add("Чтобы изменить — отправь:\n")
         b.add("• +рейтинг текст\n")
-        b.add("или ответь на сообщение с текстом командой +рейтинг")
+        b.add("или ответь на сообщение с текстом командой /рейтинг")
         return await send_rich(message, b)
 
     await set_rating_text(message.chat.id, new_text)
@@ -1097,6 +1108,27 @@ async def check_stats(message: types.Message):
     await send_rich(message, b)
 
 
+
+@dp.message(Command("обнулитьбаллы", "resetpoints"))
+async def reset_points_all_cmd(message: types.Message):
+    if not await has_level(message.from_user.id, message.chat.id, 2):
+        return
+
+    token = secrets.token_urlsafe(8).replace("-", "").replace("_", "")
+    pending_resets[token] = {
+        "created": time.time(),
+        "chat_id": message.chat.id,
+        "initiator_id": message.from_user.id
+    }
+
+    jp = await get_join_points(message.chat.id)
+
+    b = RichText()
+    b.add("⚠️ ").bold("Подтверждение").add("\n\n")
+    b.add("Сбросить баллы всем до стартового значения | ").bold(jp).add("\n")
+    b.add("Действие нельзя отменить.")
+    await send_rich(message, b, reply_markup=reset_confirm_kb(token))
+
 @dp.message(Command("топб", "topb"))
 async def show_top_command(message: types.Message):
     args = message.text.split()
@@ -1124,7 +1156,7 @@ async def process_top_pagination(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.message(Command("передать", "pay"))
+@dp.message(Command("передатьб", "payb"))
 async def transfer_points(message: types.Message):
     await update_user_data(
         message.from_user.id,
@@ -1135,12 +1167,12 @@ async def transfer_points(message: types.Message):
 
     args = message.text.split()
     if len(args) < 2:
-        return await message.reply("Используй: /передать 30 @username (или ответом: /передать 30)")
+        return await message.reply("Используй: /передатьб 30 @username или ответом: /передатьб 30")
 
     try:
         amount = int(args[1])
     except ValueError:
-        return await message.reply("Ошибка! Используй: /передать 30 @username")
+        return await message.reply("Ошибка! Используй: /передатьб 30 @username")
 
     if amount <= 0:
         return await message.reply("Введите положительное число.")
@@ -1238,7 +1270,7 @@ async def transfer_confirm(callback: types.CallbackQuery):
         return await callback.answer()
 
     if callback.from_user.id != req["sender_id"]:
-        return await callback.answer("Подтверждать может только отправитель.", show_alert=True)
+        return await callback.answer()
 
     async with pool.acquire() as conn:
         sender_pts = await conn.fetchval(
@@ -1307,7 +1339,7 @@ async def transfer_cancel(callback: types.CallbackQuery):
         return await callback.answer("Заявка не найдена или уже обработана.", show_alert=True)
 
     if callback.from_user.id != req["sender_id"]:
-        return await callback.answer("Отменить может только отправитель.", show_alert=True)
+        return await callback.answer()
 
     pending_transfers.pop(token, None)
     await callback.message.edit_text("❌ Перевод отменён.")
