@@ -525,6 +525,18 @@ async def init_db():
         """)
 
 
+async def ensure_chat_settings(chat_id: int):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO chat_settings (chat_id, join_points)
+            VALUES ($1, 50)
+            ON CONFLICT (chat_id) DO NOTHING
+            """,
+            chat_id
+        )
+
+
 async def get_join_points(chat_id: int) -> int:
     async with pool.acquire() as conn:
         jp = await conn.fetchval("SELECT join_points FROM chat_settings WHERE chat_id = $1", chat_id)
@@ -911,31 +923,42 @@ async def premium_emoji_cmd(message: types.Message):
 
         return await send_rich(message, b)
 
-    if len(parts) < 3 + arg_shift:
-        return await message.reply("❌ Не понял. Напиши: +эмодзи (или +эмодзи глоб)")
+    if len(parts) < 2 + arg_shift:
+        return await message.reply("❌ Не понял. Напиши: /эмодзи")
 
     action = parts[1 + arg_shift].lower()
-    raw_key = parts[2 + arg_shift]
 
+    # удалить все premium-эмодзи сразу
+    if action in ("очистить", "сброс", "clear", "wipe", "delall", "removeall"):
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM chat_emojis WHERE chat_id = $1", target_chat_id)
+        global _EMOJI_CACHE
+        _EMOJI_CACHE = None
+        return await message.reply(f"✅ {scope_name}: все premium-эмодзи удалены")
+
+    if len(parts) < 3 + arg_shift:
+        return await message.reply("❌ Не понял. Напиши: /эмодзи")
+
+    raw_key = parts[2 + arg_shift]
     emoji_keys = [x.strip() for x in raw_key.split("|") if x.strip()]
     if not emoji_keys:
         return await message.reply("❌ Пустой триггер.")
 
     if action in ("сет", "set"):
         if len(parts) < 4 + arg_shift:
-            return await message.reply("Используй: +эмодзи сет «триггер(ы)» «custom_emoji_id»")
+            return await message.reply("Используй: /эмодзи сет «триггеры» «custom_emoji_id»")
 
         cid = parts[3 + arg_shift].strip()
         for k in emoji_keys:
             await set_chat_emoji(target_chat_id, k, cid, enabled=True)
         return await message.reply(f"✅ {scope_name}: {', '.join(emoji_keys)} → {cid}")
 
-    if action in ("вкл", "on"):
+    if action in ("вкл", "on", "enable"):
         for k in emoji_keys:
             await toggle_chat_emoji(target_chat_id, k, True)
         return await message.reply(f"✅ {scope_name} включено: {', '.join(emoji_keys)}")
 
-    if action in ("выкл", "off"):
+    if action in ("выкл", "off", "disable"):
         for k in emoji_keys:
             await toggle_chat_emoji(target_chat_id, k, False)
         return await message.reply(f"✅ {scope_name} выключено: {', '.join(emoji_keys)}")
@@ -946,6 +969,7 @@ async def premium_emoji_cmd(message: types.Message):
         return await message.reply(f"✅ {scope_name} удалено: {', '.join(emoji_keys)}")
 
     return await message.reply("❌ Не понял команду. Напиши: /эмодзи")
+
 @dp.message(F.text.startswith("+рейтинг"))
 async def edit_rating_cmd(message: types.Message):
     if not await has_level(message.from_user.id, message.chat.id, 2) and message.from_user.id != OWNER_ID:
@@ -1128,6 +1152,70 @@ async def reset_points_all_cmd(message: types.Message):
     b.add("Сбросить баллы всем до стартового значения | ").bold(jp).add("\n")
     b.add("Действие нельзя отменить.")
     await send_rich(message, b, reply_markup=reset_confirm_kb(token))
+
+
+@dp.callback_query(F.data.startswith("rconf:"))
+async def reset_points_confirm(callback: types.CallbackQuery):
+    token = callback.data.split(":", 1)[1]
+    req = pending_resets.get(token)
+    if not req:
+        return await callback.answer()
+
+    if callback.from_user.id != req["initiator_id"]:
+        return await callback.answer()
+
+    if time.time() - req["created"] > RESET_CONFIRM_TTL:
+        pending_resets.pop(token, None)
+        try:
+            await callback.message.edit_text("⌛ Подтверждение истекло.")
+        except Exception:
+            pass
+        return await callback.answer()
+
+    chat_id = int(req["chat_id"])
+
+    if not await has_level(callback.from_user.id, chat_id, 2):
+        return await callback.answer()
+
+    await ensure_chat_settings(chat_id)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET points = (SELECT join_points FROM chat_settings WHERE chat_id = $1)
+            WHERE chat_id = $1
+            """,
+            chat_id
+        )
+
+    pending_resets.pop(token, None)
+
+    jp = await get_join_points(chat_id)
+    b = RichText()
+    b.add("✅ ").bold("Готово").add("\n")
+    b.add("Баллы всех участников выставлены в стартовое значение | ").bold(jp)
+    await send_rich(callback.message, b, edit=True)
+    return await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("rcancel:"))
+async def reset_points_cancel(callback: types.CallbackQuery):
+    token = callback.data.split(":", 1)[1]
+    req = pending_resets.get(token)
+    if not req:
+        return await callback.answer()
+
+    # не даём другим пользователям трогать чужие кнопки
+    if callback.from_user.id != req["initiator_id"]:
+        return await callback.answer()
+
+    pending_resets.pop(token, None)
+    try:
+        await callback.message.edit_text("❌ Отменено.")
+    except Exception:
+        pass
+    return await callback.answer()
 
 @dp.message(Command("топб", "topb"))
 async def show_top_command(message: types.Message):
